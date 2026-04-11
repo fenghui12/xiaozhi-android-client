@@ -1,0 +1,4 @@
+storeFile=signing/xiaozhi-release.jks
+storePassword=replace-with-your-store-password
+keyAlias=xiaozhi-release
+keyPassword=replace-with-your-key-password
