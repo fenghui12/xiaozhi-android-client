@@ -143,9 +143,11 @@ private fun XiaozhiApp() {
     val latestState by rememberUpdatedState(state)
     val context = LocalContext.current
     var uploadSession by remember { mutableStateOf<VideoUploadSession?>(null) }
+    var uploadSuccessMessage by remember { mutableStateOf<String?>(null) }
     val uploadServer = remember {
         LanVideoUploadServer(context, DigitalHumanAssetManager(context)) { role, slot, path ->
             viewModel.updateRoleVideoPath(role.id, slot, path)
+            uploadSuccessMessage = "${role.displayName}的${slot.label}视频导入成功！"
         }
     }
     val lifecycleOwner = LocalLifecycleOwner.current
@@ -296,10 +298,15 @@ private fun XiaozhiApp() {
         },
     )
     if (uploadSession != null) {
-        UploadQrDialog(uploadSession = uploadSession!!, onDismiss = {
-            uploadServer.stop()
-            uploadSession = null
-        })
+        UploadQrDialog(
+            uploadSession = uploadSession!!,
+            successMessage = uploadSuccessMessage,
+            onDismiss = {
+                uploadServer.stop()
+                uploadSession = null
+                uploadSuccessMessage = null
+            }
+        )
     }
 }
 
@@ -465,7 +472,11 @@ private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun UploadQrDialog(uploadSession: VideoUploadSession, onDismiss: () -> Unit) {
+private fun UploadQrDialog(
+    uploadSession: VideoUploadSession,
+    successMessage: String?,
+    onDismiss: () -> Unit,
+) {
     val bitmap = remember(uploadSession.url) {
         val matrix = MultiFormatWriter().encode(uploadSession.url, BarcodeFormat.QR_CODE, 720, 720)
         Bitmap.createBitmap(720, 720, Bitmap.Config.ARGB_8888).also { image ->
@@ -476,18 +487,46 @@ private fun UploadQrDialog(uploadSession: VideoUploadSession, onDismiss: () -> U
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("用手机扫码导入${uploadSession.slot.label}") },
+        title = { Text("手机扫码导入${uploadSession.slot.label}") },
         text = {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                if (successMessage != null) {
+                    Surface(
+                        color = Color(0xFFECFDF5),
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, Color(0xFFA7F3D0)),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Text(
+                            text = "🎉 $successMessage",
+                            color = Color(0xFF065F46),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.Medium,
+                            modifier = Modifier.padding(12.dp),
+                        )
+                    }
+                }
                 androidx.compose.foundation.Image(
                     bitmap = bitmap.asImageBitmap(),
                     contentDescription = "视频上传二维码",
-                    modifier = Modifier.size(260.dp),
+                    modifier = Modifier.size(240.dp),
                 )
-                Text("手机和设备连接同一 WiFi，扫码后选择视频上传", style = MaterialTheme.typography.bodySmall)
+                Text(
+                    "手机连接同一 WiFi 扫码，选择 MP4 视频直接上传",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
             }
         },
-        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
+        confirmButton = {
+            TextButton(onClick = onDismiss) {
+                Text(if (successMessage != null) "完成并关闭" else "关闭")
+            }
+        },
     )
 }
 
