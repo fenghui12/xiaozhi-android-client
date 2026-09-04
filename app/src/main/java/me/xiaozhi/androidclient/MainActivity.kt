@@ -292,8 +292,14 @@ private fun XiaozhiApp() {
         onUpdateRole = viewModel::updateRole,
         onDeleteRole = viewModel::deleteRole,
         onStartVideoUpload = { roleId, slot ->
-            state.roleProfiles.firstOrNull { it.id == roleId }?.let { role ->
-                runCatching { uploadSession = uploadServer.start(role, slot) }
+            latestState.roleProfiles.firstOrNull { it.id == roleId }?.let { role ->
+                runCatching {
+                    uploadSession = uploadServer.start(role, slot)
+                }.onFailure { error ->
+                    android.util.Log.e("LanVideoUpload", "Failed to start upload server", error)
+                }
+            } ?: run {
+                android.util.Log.e("LanVideoUpload", "Role not found for id: $roleId")
             }
         },
     )
@@ -478,11 +484,16 @@ private fun UploadQrDialog(
     onDismiss: () -> Unit,
 ) {
     val bitmap = remember(uploadSession.url) {
-        val matrix = MultiFormatWriter().encode(uploadSession.url, BarcodeFormat.QR_CODE, 720, 720)
-        Bitmap.createBitmap(720, 720, Bitmap.Config.ARGB_8888).also { image ->
-            for (x in 0 until 720) for (y in 0 until 720) {
-                image.setPixel(x, y, if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+        runCatching {
+            val matrix = MultiFormatWriter().encode(uploadSession.url, BarcodeFormat.QR_CODE, 720, 720)
+            Bitmap.createBitmap(720, 720, Bitmap.Config.ARGB_8888).also { image ->
+                for (x in 0 until 720) for (y in 0 until 720) {
+                    image.setPixel(x, y, if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+                }
             }
+        }.getOrElse { error ->
+            android.util.Log.e("UploadQrDialog", "Failed to generate QR bitmap", error)
+            null
         }
     }
     AlertDialog(
@@ -510,10 +521,19 @@ private fun UploadQrDialog(
                         )
                     }
                 }
-                androidx.compose.foundation.Image(
-                    bitmap = bitmap.asImageBitmap(),
-                    contentDescription = "视频上传二维码",
-                    modifier = Modifier.size(240.dp),
+                if (bitmap != null) {
+                    androidx.compose.foundation.Image(
+                        bitmap = bitmap.asImageBitmap(),
+                        contentDescription = "视频上传二维码",
+                        modifier = Modifier.size(240.dp),
+                    )
+                } else {
+                    Text("无法生成二维码，请检查网络", color = MaterialTheme.colorScheme.error)
+                }
+                Text(
+                    text = uploadSession.url,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
                 )
                 Text(
                     "手机连接同一 WiFi 扫码，选择 MP4 视频直接上传",
@@ -756,7 +776,15 @@ private fun RoleProfilesCard(
             role = editingRole,
             onPickAvatar = { editingRole?.id?.let(onPickRoleAvatar) },
             onPickVideo = { slot -> editingRole?.id?.let { onPickRoleVideo(it, slot) } },
-            onStartVideoUpload = { slot -> editingRole?.id?.let { onStartVideoUpload(it, slot) } },
+            onStartVideoUpload = { slot ->
+                val targetRole = editingRole
+                android.util.Log.d("LanVideoUpload", "RoleEditorDialog click 扫码: slot=$slot, editingRole=$targetRole")
+                targetRole?.id?.let { id ->
+                    onStartVideoUpload(id, slot)
+                } ?: run {
+                    android.util.Log.e("LanVideoUpload", "editingRole is null when clicking 扫码")
+                }
+            },
             onDismiss = {
                 editingRoleId = null
                 addingRole = false

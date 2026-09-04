@@ -167,10 +167,12 @@ class LanVideoUploadServer(
         str.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
 
     private fun resolveLocalIp(): String {
-        val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-        val ipInt = wifiManager?.connectionInfo?.ipAddress ?: 0
-        if (ipInt != 0) {
-            return Formatter.formatIpAddress(ipInt)
+        runCatching {
+            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
+            val ipInt = wifiManager?.connectionInfo?.ipAddress ?: 0
+            if (ipInt != 0) {
+                return Formatter.formatIpAddress(ipInt)
+            }
         }
         val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "127.0.0.1"
         for (item in interfaces.toList()) {
