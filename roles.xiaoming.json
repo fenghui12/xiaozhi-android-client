@@ -1,0 +1,11 @@
+{
+  "roles": [
+    {
+      "id": "xiaoming",
+      "displayName": "小明",
+      "deviceId": "02:ab:0d:f8:be:38",
+      "clientId": "079ce6e4-51ae-40e5-9bf8-02ebd92d8ffd",
+      "wakeWords": ["你好小明", "小明同学"]
+    }
+  ]
+}

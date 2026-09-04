@@ -1,0 +1,11 @@
+{
+  "roles": [
+    {
+      "id": "xiaoming",
+      "displayName": "小明",
+      "deviceId": "替换为小明在小智后台绑定的 Device-Id",
+      "clientId": "替换为小明在小智后台绑定的 Client-Id",
+      "wakeWords": ["小明同学", "你好小明"]
+    }
+  ]
+}

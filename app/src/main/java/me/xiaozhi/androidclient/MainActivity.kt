@@ -4,6 +4,9 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import java.io.File
+import android.widget.VideoView
+import android.view.ViewGroup
+import android.graphics.Bitmap
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -39,12 +42,15 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Timer
+import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalIconButton
@@ -58,6 +64,7 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -72,8 +79,10 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
@@ -86,13 +95,24 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import kotlinx.coroutines.delay
 import coil.compose.AsyncImage
-import me.xiaozhi.androidclient.audio.WakeWordRecognizer
+import me.xiaozhi.androidclient.audio.SherpaWakeWordRecognizer
 import me.xiaozhi.androidclient.model.ChatMessage
 import me.xiaozhi.androidclient.model.ChatRole
 import me.xiaozhi.androidclient.model.ConnectionStatus
 import me.xiaozhi.androidclient.model.ListeningMode
 import me.xiaozhi.androidclient.model.LogLine
+import me.xiaozhi.androidclient.model.RoleProfile
+import me.xiaozhi.androidclient.model.ScheduledTaskUi
 import me.xiaozhi.androidclient.model.UiState
+import me.xiaozhi.androidclient.model.DigitalHumanSlot
+import me.xiaozhi.androidclient.digitalhuman.DigitalHumanAssetManager
+import me.xiaozhi.androidclient.digitalhuman.LanVideoUploadServer
+import me.xiaozhi.androidclient.digitalhuman.VideoUploadSession
+import com.google.zxing.BarcodeFormat
+import com.google.zxing.MultiFormatWriter
+import me.xiaozhi.androidclient.model.hasCompleteDigitalHuman
+import me.xiaozhi.androidclient.model.videoPath
+import me.xiaozhi.androidclient.model.canRunWakeWordRecognizer
 import me.xiaozhi.androidclient.ui.MainViewModel
 import me.xiaozhi.androidclient.ui.theme.XiaozhiClientTheme
 
@@ -100,7 +120,6 @@ private enum class AppScreen { CHAT, SETTINGS }
 
 private sealed interface PendingAudioAction {
     data class StartListening(val mode: ListeningMode) : PendingAudioAction
-    data object EnableWakeWord : PendingAudioAction
 }
 
 private val ChatBackground = Color(0xFFF7F4F9)
@@ -123,14 +142,22 @@ private fun XiaozhiApp() {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(state)
     val context = LocalContext.current
+    var uploadSession by remember { mutableStateOf<VideoUploadSession?>(null) }
+    val uploadServer = remember {
+        LanVideoUploadServer(context, DigitalHumanAssetManager(context)) { role, slot, path ->
+            viewModel.updateRoleVideoPath(role.id, slot, path)
+        }
+    }
     val lifecycleOwner = LocalLifecycleOwner.current
     var currentScreen by rememberSaveable { mutableStateOf(AppScreen.CHAT) }
     var isForeground by remember { mutableStateOf(true) }
     var pendingAudioAction by remember { mutableStateOf<PendingAudioAction?>(null) }
     var playbackCooldownActive by remember { mutableStateOf(false) }
+    var avatarRoleId by remember { mutableStateOf<String?>(null) }
+    var videoImportTarget by remember { mutableStateOf<Pair<String, DigitalHumanSlot>?>(null) }
 
     val wakeWordRecognizer = remember(context) {
-        WakeWordRecognizer(
+        SherpaWakeWordRecognizer(
             context = context,
             onWakeWordDetected = viewModel::onWakeWordDetected,
             onStatusChanged = viewModel::updateWakeWordStatus,
@@ -147,11 +174,6 @@ private fun XiaozhiApp() {
                 else viewModel.onMicrophonePermissionDenied("capture")
             }
 
-            PendingAudioAction.EnableWakeWord -> {
-                if (granted) viewModel.updateWakeWordEnabled(true)
-                else viewModel.onMicrophonePermissionDenied("wake_word")
-            }
-
             null -> Unit
         }
         pendingAudioAction = null
@@ -160,9 +182,18 @@ private fun XiaozhiApp() {
     val avatarPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent(),
     ) { uri ->
-        if (uri != null) {
-            viewModel.importAssistantAvatar(uri)
+        val roleId = avatarRoleId
+        if (uri != null && roleId != null) {
+            viewModel.importRoleAvatar(roleId, uri)
         }
+        avatarRoleId = null
+    }
+    val videoPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+    ) { uri ->
+        val target = videoImportTarget
+        if (uri != null && target != null) viewModel.importRoleVideo(target.first, target.second, uri)
+        videoImportTarget = null
     }
 
     DisposableEffect(lifecycleOwner, wakeWordRecognizer) {
@@ -204,10 +235,12 @@ private fun XiaozhiApp() {
     LaunchedEffect(
         state.wakeWordEnabled,
         state.wakeWords,
+        state.roleWakeWords,
         state.isRecording,
         state.isAssistantSpeaking,
         state.isTurnActive,
         state.connectionStatus,
+        state.isSilentTransportRecovery,
         playbackCooldownActive,
         isForeground,
     ) {
@@ -217,8 +250,8 @@ private fun XiaozhiApp() {
             !state.isAssistantSpeaking &&
             !state.isTurnActive &&
             !playbackCooldownActive &&
-            state.connectionStatus != ConnectionStatus.CONNECTING
-        if (shouldRun) wakeWordRecognizer.start(state.wakeWords)
+            state.canRunWakeWordRecognizer()
+        if (shouldRun) wakeWordRecognizer.start(state.roleWakeWords.ifBlank { state.wakeWords })
         else wakeWordRecognizer.stop(updateStatus = false)
     }
 
@@ -235,59 +268,39 @@ private fun XiaozhiApp() {
         }
     }
 
-    val requestWakeWordEnable: (Boolean) -> Unit = { enabled ->
-        if (!enabled) {
-            viewModel.updateWakeWordEnabled(false)
-        } else {
-            val granted = ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.RECORD_AUDIO,
-            ) == PackageManager.PERMISSION_GRANTED
-            if (granted) {
-                viewModel.updateWakeWordEnabled(true)
-            } else {
-                pendingAudioAction = PendingAudioAction.EnableWakeWord
-                permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
-            }
-        }
-    }
-
     XiaozhiScreen(
         state = latestState,
         currentScreen = currentScreen,
         onOpenSettings = { currentScreen = AppScreen.SETTINGS },
         onBackToChat = { currentScreen = AppScreen.CHAT },
-        onPickAssistantAvatar = { avatarPickerLauncher.launch("image/*") },
-        onFetchOfficialConfig = viewModel::fetchOfficialConfig,
-        onRetryActivation = viewModel::retryActivation,
-        onConnect = viewModel::connect,
-        onDisconnect = viewModel::disconnect,
+        onPickRoleAvatar = { roleId ->
+            avatarRoleId = roleId
+            avatarPickerLauncher.launch("image/*")
+        },
+        onPickRoleVideo = { roleId, slot ->
+            videoImportTarget = roleId to slot
+            videoPickerLauncher.launch("video/*")
+        },
         onStartListening = requestMicrophoneForMode,
         onStopListening = viewModel::stopListening,
         onSendDraft = viewModel::sendDraftMessage,
         onDraftChanged = viewModel::updateDraftMessage,
-        onSendMcp = viewModel::sendMcp,
-        onClearLogs = viewModel::clearLogs,
-        onOtaUrlChanged = viewModel::updateOtaUrl,
-        onDeviceIdChanged = viewModel::updateDeviceId,
-        onClientIdChanged = viewModel::updateClientId,
-        onWebsocketUrlChanged = viewModel::updateWebsocketUrl,
-        onTokenChanged = viewModel::updateAuthToken,
-        onProtocolVersionChanged = viewModel::updateProtocolVersion,
-        onMcpPayloadChanged = viewModel::updateMcpPayload,
-        onWakeWordEnabledChanged = requestWakeWordEnable,
-        onWakeWordsChanged = viewModel::updateWakeWords,
-        onTermuxEnabledChanged = viewModel::updateTermuxEnabled,
-        onPythonPathChanged = viewModel::updatePythonPath,
-        onPythonScriptPathChanged = viewModel::updatePythonScriptPath,
-        onPythonWorkdirChanged = viewModel::updatePythonWorkdir,
-        onTermuxApiCommandChanged = viewModel::updateTermuxApiCommand,
-        onTermuxApiArgumentsChanged = viewModel::updateTermuxApiArguments,
-        onDebugLoggingEnabledChanged = viewModel::updateDebugLoggingEnabled,
-        onDebugWavDumpEnabledChanged = viewModel::updateDebugWavDumpEnabled,
-        onRunPythonScript = viewModel::runPythonScript,
-        onRunTermuxApiCommand = viewModel::runTermuxApiCommand,
+        onSelectRole = viewModel::selectRole,
+        onAddRole = viewModel::addRole,
+        onUpdateRole = viewModel::updateRole,
+        onDeleteRole = viewModel::deleteRole,
+        onStartVideoUpload = { roleId, slot ->
+            state.roleProfiles.firstOrNull { it.id == roleId }?.let { role ->
+                runCatching { uploadSession = uploadServer.start(role, slot) }
+            }
+        },
     )
+    if (uploadSession != null) {
+        UploadQrDialog(uploadSession = uploadSession!!, onDismiss = {
+            uploadServer.stop()
+            uploadSession = null
+        })
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -297,46 +310,27 @@ private fun XiaozhiScreen(
     currentScreen: AppScreen,
     onOpenSettings: () -> Unit,
     onBackToChat: () -> Unit,
-    onPickAssistantAvatar: () -> Unit,
-    onFetchOfficialConfig: () -> Unit,
-    onRetryActivation: () -> Unit,
-    onConnect: () -> Unit,
-    onDisconnect: () -> Unit,
+    onPickRoleAvatar: (String) -> Unit,
+    onPickRoleVideo: (String, DigitalHumanSlot) -> Unit,
     onStartListening: (ListeningMode) -> Unit,
     onStopListening: () -> Unit,
     onSendDraft: () -> Unit,
     onDraftChanged: (String) -> Unit,
-    onSendMcp: () -> Unit,
-    onClearLogs: () -> Unit,
-    onOtaUrlChanged: (String) -> Unit,
-    onDeviceIdChanged: (String) -> Unit,
-    onClientIdChanged: (String) -> Unit,
-    onWebsocketUrlChanged: (String) -> Unit,
-    onTokenChanged: (String) -> Unit,
-    onProtocolVersionChanged: (String) -> Unit,
-    onMcpPayloadChanged: (String) -> Unit,
-    onWakeWordEnabledChanged: (Boolean) -> Unit,
-    onWakeWordsChanged: (String) -> Unit,
-    onTermuxEnabledChanged: (Boolean) -> Unit,
-    onPythonPathChanged: (String) -> Unit,
-    onPythonScriptPathChanged: (String) -> Unit,
-    onPythonWorkdirChanged: (String) -> Unit,
-    onTermuxApiCommandChanged: (String) -> Unit,
-    onTermuxApiArgumentsChanged: (String) -> Unit,
-    onDebugLoggingEnabledChanged: (Boolean) -> Unit,
-    onDebugWavDumpEnabledChanged: (Boolean) -> Unit,
-    onRunPythonScript: () -> Unit,
-    onRunTermuxApiCommand: () -> Unit,
+    onSelectRole: (String) -> Unit,
+    onAddRole: (String, String) -> Unit,
+    onUpdateRole: (String, String, String) -> Unit,
+    onDeleteRole: (String) -> Unit,
+    onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
 ) {
     Scaffold(
         containerColor = if (currentScreen == AppScreen.SETTINGS) SettingsBackground else ChatBackground,
         topBar = {
             if (currentScreen == AppScreen.SETTINGS) {
                 TopAppBar(
-                    title = { Text("配置中心", fontWeight = FontWeight.SemiBold) },
+                    title = { Text("角色设置", fontWeight = FontWeight.SemiBold) },
                     navigationIcon = {
                         IconButton(onClick = onBackToChat) {
-                            Icon(Icons.Default.ArrowBack, contentDescription = "返回聊天")
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回聊天")
                         }
                     },
                     colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White),
@@ -349,7 +343,6 @@ private fun XiaozhiScreen(
                 state = state,
                 padding = padding,
                 onOpenSettings = onOpenSettings,
-                onPickAssistantAvatar = onPickAssistantAvatar,
                 onStartListening = onStartListening,
                 onStopListening = onStopListening,
                 onSendDraft = onSendDraft,
@@ -359,31 +352,13 @@ private fun XiaozhiScreen(
             AppScreen.SETTINGS -> SettingsScreen(
                 state = state,
                 padding = padding,
-                onFetchOfficialConfig = onFetchOfficialConfig,
-                onRetryActivation = onRetryActivation,
-                onConnect = onConnect,
-                onDisconnect = onDisconnect,
-                onSendMcp = onSendMcp,
-                onClearLogs = onClearLogs,
-                onOtaUrlChanged = onOtaUrlChanged,
-                onDeviceIdChanged = onDeviceIdChanged,
-                onClientIdChanged = onClientIdChanged,
-                onWebsocketUrlChanged = onWebsocketUrlChanged,
-                onTokenChanged = onTokenChanged,
-                onProtocolVersionChanged = onProtocolVersionChanged,
-                onMcpPayloadChanged = onMcpPayloadChanged,
-                onWakeWordEnabledChanged = onWakeWordEnabledChanged,
-                onWakeWordsChanged = onWakeWordsChanged,
-                onTermuxEnabledChanged = onTermuxEnabledChanged,
-                onPythonPathChanged = onPythonPathChanged,
-                onPythonScriptPathChanged = onPythonScriptPathChanged,
-                onPythonWorkdirChanged = onPythonWorkdirChanged,
-                onTermuxApiCommandChanged = onTermuxApiCommandChanged,
-                onTermuxApiArgumentsChanged = onTermuxApiArgumentsChanged,
-                onDebugLoggingEnabledChanged = onDebugLoggingEnabledChanged,
-                onDebugWavDumpEnabledChanged = onDebugWavDumpEnabledChanged,
-                onRunPythonScript = onRunPythonScript,
-                onRunTermuxApiCommand = onRunTermuxApiCommand,
+                onSelectRole = onSelectRole,
+                onPickRoleAvatar = onPickRoleAvatar,
+                onPickRoleVideo = onPickRoleVideo,
+                onAddRole = onAddRole,
+                onUpdateRole = onUpdateRole,
+                onDeleteRole = onDeleteRole,
+                onStartVideoUpload = onStartVideoUpload,
             )
         }
     }
@@ -394,7 +369,6 @@ private fun ChatScreen(
     state: UiState,
     padding: PaddingValues,
     onOpenSettings: () -> Unit,
-    onPickAssistantAvatar: () -> Unit,
     onStartListening: (ListeningMode) -> Unit,
     onStopListening: () -> Unit,
     onSendDraft: () -> Unit,
@@ -419,7 +393,6 @@ private fun ChatScreen(
         ChatHeaderCard(
             state = state,
             onOpenSettings = onOpenSettings,
-            onPickAssistantAvatar = onPickAssistantAvatar,
         )
 
         if (state.activationPending) {
@@ -429,12 +402,21 @@ private fun ChatScreen(
             )
         }
 
-        ChatMessageList(
-            messages = state.chatMessages,
-            assistantAvatarPath = state.assistantAvatarPath,
-            listState = listState,
-            modifier = Modifier.weight(1f),
-        )
+        if (state.scheduledTasks.isNotEmpty()) {
+            CurrentTasksPanel(tasks = state.scheduledTasks)
+        }
+
+        if (state.activeRoleDigitalHumanReady) {
+            DigitalHumanPanel(state = state, modifier = Modifier.weight(1f))
+        } else {
+            ChatMessageList(
+                messages = state.chatMessages,
+                assistantAvatarPath = state.activeRoleAvatarPath,
+                assistantAvatarText = state.activeRoleName.takeLast(1).ifBlank { "智" },
+                listState = listState,
+                modifier = Modifier.weight(1f),
+            )
+        }
 
         ComposerCard(
             state = state,
@@ -447,37 +429,164 @@ private fun ChatScreen(
 }
 
 @Composable
+private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
+    val path = when {
+        state.isAssistantSpeaking -> state.activeRoleSpeakingVideoPath
+        state.isRecording || state.isTurnActive -> state.activeRoleListeningVideoPath
+        else -> state.activeRoleIdleVideoPath
+    }
+    AndroidView(
+        modifier = modifier.fillMaxWidth(),
+        factory = { context ->
+            VideoView(context).apply {
+                layoutParams = ViewGroup.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                    ViewGroup.LayoutParams.MATCH_PARENT,
+                )
+                setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                setOnPreparedListener { player ->
+                    player.isLooping = true
+                    player.setVolume(0f, 0f)
+                    start()
+                }
+            }
+        },
+        update = { view ->
+            if (path.isBlank() || !File(path).exists()) {
+                view.stopPlayback()
+            } else if (view.tag != path) {
+                view.tag = path
+                view.setVideoPath(path)
+                view.start()
+            }
+        },
+        onRelease = { it.stopPlayback() },
+    )
+}
+
+@Composable
+private fun UploadQrDialog(uploadSession: VideoUploadSession, onDismiss: () -> Unit) {
+    val bitmap = remember(uploadSession.url) {
+        val matrix = MultiFormatWriter().encode(uploadSession.url, BarcodeFormat.QR_CODE, 720, 720)
+        Bitmap.createBitmap(720, 720, Bitmap.Config.ARGB_8888).also { image ->
+            for (x in 0 until 720) for (y in 0 until 720) {
+                image.setPixel(x, y, if (matrix[x, y]) android.graphics.Color.BLACK else android.graphics.Color.WHITE)
+            }
+        }
+    }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("用手机扫码导入${uploadSession.slot.label}") },
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                androidx.compose.foundation.Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "视频上传二维码",
+                    modifier = Modifier.size(260.dp),
+                )
+                Text("手机和设备连接同一 WiFi，扫码后选择视频上传", style = MaterialTheme.typography.bodySmall)
+            }
+        },
+        confirmButton = { TextButton(onClick = onDismiss) { Text("完成") } },
+    )
+}
+
+@Composable
+private fun CurrentTasksPanel(tasks: List<ScheduledTaskUi>) {
+    Surface(
+        color = Color.White,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Text(
+                    text = "当前任务",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                Text(
+                    text = tasks.size.toString(),
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            tasks.forEachIndexed { index, task ->
+                if (index > 0) HorizontalDivider(modifier = Modifier.padding(horizontal = 14.dp))
+                CurrentTaskRow(task)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CurrentTaskRow(task: ScheduledTaskUi) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp, vertical = 10.dp),
+        horizontalArrangement = Arrangement.spacedBy(10.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(
+            imageVector = if (task.kind == "监督提醒") Icons.Default.Visibility else Icons.Default.Timer,
+            contentDescription = null,
+            tint = if (task.kind == "监督提醒") Color(0xFFB45309) else Color(0xFF2563EB),
+            modifier = Modifier.size(20.dp),
+        )
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(2.dp),
+        ) {
+            Text(
+                text = task.message,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = "${task.kind} · ${task.status}",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Text(
+            text = task.remainingSeconds?.let(::formatTaskCountdown) ?: "--",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+    }
+}
+
+private fun formatTaskCountdown(totalSeconds: Long): String {
+    val hours = totalSeconds / 3_600
+    val minutes = totalSeconds % 3_600 / 60
+    val seconds = totalSeconds % 60
+    return when {
+        hours > 0 -> "%d:%02d:%02d".format(hours, minutes, seconds)
+        else -> "%02d:%02d".format(minutes, seconds)
+    }
+}
+
+@Composable
 private fun SettingsScreen(
     state: UiState,
     padding: PaddingValues,
-    onFetchOfficialConfig: () -> Unit,
-    onRetryActivation: () -> Unit,
-    onConnect: () -> Unit,
-    onDisconnect: () -> Unit,
-    onSendMcp: () -> Unit,
-    onClearLogs: () -> Unit,
-    onOtaUrlChanged: (String) -> Unit,
-    onDeviceIdChanged: (String) -> Unit,
-    onClientIdChanged: (String) -> Unit,
-    onWebsocketUrlChanged: (String) -> Unit,
-    onTokenChanged: (String) -> Unit,
-    onProtocolVersionChanged: (String) -> Unit,
-    onMcpPayloadChanged: (String) -> Unit,
-    onWakeWordEnabledChanged: (Boolean) -> Unit,
-    onWakeWordsChanged: (String) -> Unit,
-    onTermuxEnabledChanged: (Boolean) -> Unit,
-    onPythonPathChanged: (String) -> Unit,
-    onPythonScriptPathChanged: (String) -> Unit,
-    onPythonWorkdirChanged: (String) -> Unit,
-    onTermuxApiCommandChanged: (String) -> Unit,
-    onTermuxApiArgumentsChanged: (String) -> Unit,
-    onDebugLoggingEnabledChanged: (Boolean) -> Unit,
-    onDebugWavDumpEnabledChanged: (Boolean) -> Unit,
-    onRunPythonScript: () -> Unit,
-    onRunTermuxApiCommand: () -> Unit,
+    onSelectRole: (String) -> Unit,
+    onPickRoleAvatar: (String) -> Unit,
+    onPickRoleVideo: (String, DigitalHumanSlot) -> Unit,
+    onAddRole: (String, String) -> Unit,
+    onUpdateRole: (String, String, String) -> Unit,
+    onDeleteRole: (String) -> Unit,
+    onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
 ) {
     val scrollState = rememberScrollState()
-    var developerExpanded by rememberSaveable { mutableStateOf(false) }
 
     Column(
         modifier = Modifier
@@ -488,179 +597,15 @@ private fun SettingsScreen(
             .padding(horizontal = 16.dp, vertical = 18.dp),
         verticalArrangement = Arrangement.spacedBy(18.dp),
     ) {
-        SettingsSummaryCard(state = state)
-
-        SectionTitle("官方接入")
-        SettingsCard {
-            SettingsField(
-                icon = "🌐",
-                title = "OTA 地址",
-                subtitle = "官方配置入口",
-                value = state.otaUrl,
-                onValueChange = onOtaUrlChanged,
-            )
-            HorizontalDivider()
-            SettingsField(
-                icon = "🧩",
-                title = "设备 ID",
-                subtitle = "握手头里的 Device-Id",
-                value = state.deviceId,
-                onValueChange = onDeviceIdChanged,
-            )
-            HorizontalDivider()
-            SettingsField(
-                icon = "🆔",
-                title = "客户端 ID",
-                subtitle = "握手头里的 Client-Id",
-                value = state.clientId,
-                onValueChange = onClientIdChanged,
-            )
-            HorizontalDivider()
-            SettingsField(
-                icon = "🔗",
-                title = "WebSocket 地址",
-                subtitle = "官方实时会话地址",
-                value = state.websocketUrl,
-                onValueChange = onWebsocketUrlChanged,
-            )
-            HorizontalDivider()
-            SettingsField(
-                icon = "🔐",
-                title = "授权 Token",
-                subtitle = "OTA 返回的 Bearer Token",
-                value = state.authToken,
-                onValueChange = onTokenChanged,
-            )
-            HorizontalDivider()
-            SettingsField(
-                icon = "🧾",
-                title = "协议版本",
-                subtitle = "官方 WebSocket 二进制协议版本",
-                value = state.protocolVersion,
-                onValueChange = onProtocolVersionChanged,
-                keyboardType = KeyboardType.Number,
-            )
-            HorizontalDivider()
-            SettingsActionRow(
-                primaryLabel = "获取配置",
-                onPrimaryClick = onFetchOfficialConfig,
-                secondaryLabel = if (state.activationPending) "激活后重试" else "连接",
-                onSecondaryClick = if (state.activationPending) onRetryActivation else onConnect,
-                tertiaryLabel = if (state.activationPending) null else "断开",
-                onTertiaryClick = if (state.activationPending) null else onDisconnect,
-            )
-        }
-
-        SectionTitle("语音体验")
-        SettingsCard {
-            SettingsSwitch(
-                icon = "🎙️",
-                title = "语音唤醒",
-                subtitle = state.wakeWordStatus.ifBlank { "未开启" },
-                checked = state.wakeWordEnabled,
-                onCheckedChange = onWakeWordEnabledChanged,
-            )
-            HorizontalDivider()
-            SettingsField(
-                icon = "🗣️",
-                title = "唤醒词",
-                subtitle = "多个唤醒词用英文逗号分隔",
-                value = state.wakeWords,
-                onValueChange = onWakeWordsChanged,
-            )
-            HorizontalDivider()
-            SettingsStatus(
-                icon = "🔊",
-                title = "当前音频路由",
-                subtitle = state.audioRouteStatus,
-            )
-            HorizontalDivider()
-            SettingsStatus(
-                icon = "📡",
-                title = "连接状态",
-                subtitle = state.connectionStatus.toChineseText(),
-            )
-        }
-
-        SectionTitle("本地扩展")
-        SettingsCard {
-            SettingsSwitch(
-                icon = "🧰",
-                title = "Python / MCP 运行入口",
-                subtitle = state.pythonRuntimeStatus.ifBlank { "未启用" },
-                checked = state.termuxEnabled,
-                onCheckedChange = onTermuxEnabledChanged,
-            )
-            if (state.termuxEnabled) {
-                HorizontalDivider()
-                SettingsField(
-                    icon = "🐍",
-                    title = "Python 可执行文件",
-                    subtitle = "推荐使用 Termux 里的 Python",
-                    value = state.pythonPath,
-                    onValueChange = onPythonPathChanged,
-                )
-                HorizontalDivider()
-                SettingsField(
-                    icon = "📄",
-                    title = "Python 脚本",
-                    subtitle = "要启动的本地 MCP Python 文件",
-                    value = state.pythonScriptPath,
-                    onValueChange = onPythonScriptPathChanged,
-                )
-                HorizontalDivider()
-                SettingsField(
-                    icon = "📁",
-                    title = "工作目录",
-                    subtitle = "可留空，默认由 Termux 决定",
-                    value = state.pythonWorkdir,
-                    onValueChange = onPythonWorkdirChanged,
-                )
-                HorizontalDivider()
-                SettingsAction(
-                    icon = "▶️",
-                    title = "启动本地 Python",
-                    subtitle = "通过 Termux 拉起脚本，用于本地 MCP 服务",
-                    actionLabel = "运行",
-                    onClick = onRunPythonScript,
-                )
-                HorizontalDivider()
-                SettingsField(
-                    icon = "📲",
-                    title = "Termux API 命令",
-                    subtitle = state.termuxApiStatus.ifBlank { "未启用" },
-                    value = state.termuxApiCommand,
-                    onValueChange = onTermuxApiCommandChanged,
-                )
-                HorizontalDivider()
-                SettingsField(
-                    icon = "⌨️",
-                    title = "Termux API 参数",
-                    subtitle = "空格分隔，支持引号",
-                    value = state.termuxApiArguments,
-                    onValueChange = onTermuxApiArgumentsChanged,
-                )
-                HorizontalDivider()
-                SettingsAction(
-                    icon = "⚙️",
-                    title = "执行 termux-api",
-                    subtitle = "例如 termux-battery-status 或 termux-toast",
-                    actionLabel = "执行",
-                    onClick = onRunTermuxApiCommand,
-                )
-            }
-        }
-
-        SectionTitle("开发者工具")
-        DeveloperToolsCard(
-            expanded = developerExpanded,
-            onToggle = { developerExpanded = !developerExpanded },
+        RoleProfilesCard(
             state = state,
-            onDebugLoggingEnabledChanged = onDebugLoggingEnabledChanged,
-            onDebugWavDumpEnabledChanged = onDebugWavDumpEnabledChanged,
-            onMcpPayloadChanged = onMcpPayloadChanged,
-            onSendMcp = onSendMcp,
-            onClearLogs = onClearLogs,
+            onSelectRole = onSelectRole,
+            onPickRoleAvatar = onPickRoleAvatar,
+            onPickRoleVideo = onPickRoleVideo,
+            onStartVideoUpload = onStartVideoUpload,
+            onAddRole = onAddRole,
+            onUpdateRole = onUpdateRole,
+            onDeleteRole = onDeleteRole,
         )
     }
 }
@@ -669,12 +614,18 @@ private fun SettingsScreen(
 private fun ChatHeaderCard(
     state: UiState,
     onOpenSettings: () -> Unit,
-    onPickAssistantAvatar: () -> Unit,
 ) {
     val headline = when {
-        state.isAssistantSpeaking -> "说话中"
+        state.isAssistantSpeaking -> "讲话中"
         state.isRecording -> "聆听中"
-        else -> "空闲"
+        state.isTurnActive -> "聆听中"
+        state.connectionStatus == ConnectionStatus.CONNECTED -> "待机中"
+        state.isSilentTransportRecovery -> "待机中"
+        state.activationPending -> "待激活"
+        state.connectionStatus == ConnectionStatus.FETCHING_CONFIG -> "获取配置中"
+        state.connectionStatus == ConnectionStatus.CONNECTING -> "连接中"
+        state.connectionStatus == ConnectionStatus.FAILED -> "连接失败"
+        else -> "未连接"
     }
 
     Surface(
@@ -699,13 +650,13 @@ private fun ChatHeaderCard(
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     AssistantAvatar(
-                        avatarPath = state.assistantAvatarPath,
+                        avatarPath = state.activeRoleAvatarPath,
+                        fallbackText = state.activeRoleName.takeLast(1).ifBlank { "智" },
                         modifier = Modifier.size(56.dp),
-                        onClick = onPickAssistantAvatar,
                     )
                     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                         Text(
-                            text = "小智 AI",
+                            text = "语音 AI 交互",
                             style = MaterialTheme.typography.titleLarge,
                             fontWeight = FontWeight.Bold,
                         )
@@ -716,12 +667,196 @@ private fun ChatHeaderCard(
                         )
                     }
                 }
-                FilledTonalIconButton(onClick = onOpenSettings) {
-                    Icon(Icons.Default.Settings, contentDescription = "设置")
+                IconButton(onClick = onOpenSettings) {
+                    Icon(Icons.Default.Settings, contentDescription = "打开设置")
                 }
             }
         }
     }
+}
+
+@Composable
+private fun RoleProfilesCard(
+    state: UiState,
+    onSelectRole: (String) -> Unit,
+    onPickRoleAvatar: (String) -> Unit,
+    onPickRoleVideo: (String, DigitalHumanSlot) -> Unit,
+    onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
+    onAddRole: (String, String) -> Unit,
+    onUpdateRole: (String, String, String) -> Unit,
+    onDeleteRole: (String) -> Unit,
+) {
+    var editingRoleId by remember { mutableStateOf<String?>(null) }
+    var addingRole by remember { mutableStateOf(false) }
+    val editingRole = state.roleProfiles.firstOrNull { it.id == editingRoleId }
+
+    SettingsCard {
+        state.roleProfiles.forEachIndexed { index, role ->
+            RoleProfileRow(
+                role = role,
+                active = role.id == state.activeRoleId,
+                onSelect = { onSelectRole(role.id) },
+                onEdit = { editingRoleId = role.id },
+                onDelete = { onDeleteRole(role.id) },
+            )
+            if (index < state.roleProfiles.lastIndex) HorizontalDivider()
+        }
+        HorizontalDivider()
+        TextButton(
+            onClick = { addingRole = true },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+        ) {
+            Text("添加角色")
+        }
+    }
+
+    if (editingRole != null || addingRole) {
+        RoleEditorDialog(
+            role = editingRole,
+            onPickAvatar = { editingRole?.id?.let(onPickRoleAvatar) },
+            onPickVideo = { slot -> editingRole?.id?.let { onPickRoleVideo(it, slot) } },
+            onStartVideoUpload = { slot -> editingRole?.id?.let { onStartVideoUpload(it, slot) } },
+            onDismiss = {
+                editingRoleId = null
+                addingRole = false
+            },
+            onSave = { name, wakeWords ->
+                val role = editingRole
+                if (role == null) onAddRole(name, wakeWords)
+                else onUpdateRole(role.id, name, wakeWords)
+                editingRoleId = null
+                addingRole = false
+            },
+        )
+    }
+}
+
+@Composable
+private fun RoleProfileRow(
+    role: RoleProfile,
+    active: Boolean,
+    onSelect: () -> Unit,
+    onEdit: () -> Unit,
+    onDelete: () -> Unit,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onSelect)
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            AssistantAvatar(
+                avatarPath = role.avatarPath,
+                fallbackText = role.displayName.takeLast(1),
+                modifier = Modifier.size(46.dp),
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(role.displayName, fontWeight = FontWeight.SemiBold)
+                Text(
+                    text = when {
+                        active -> "当前使用 · ${role.wakeWords.joinToString("、")}"
+                        role.isBound -> "已绑定 · ${role.wakeWords.joinToString("、")}"
+                        else -> "未绑定 · ${role.wakeWords.joinToString("、")}"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            if (active) StatusTag(text = "当前")
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onEdit) { Text("编辑") }
+            OutlinedButton(onClick = onDelete) { Text("删除") }
+        }
+    }
+}
+
+@Composable
+private fun RoleEditorDialog(
+    role: RoleProfile?,
+    onPickAvatar: () -> Unit,
+    onPickVideo: (DigitalHumanSlot) -> Unit,
+    onStartVideoUpload: (DigitalHumanSlot) -> Unit,
+    onDismiss: () -> Unit,
+    onSave: (String, String) -> Unit,
+) {
+    var name by remember(role?.id) { mutableStateOf(role?.displayName.orEmpty()) }
+    var wakeWords by remember(role?.id) { mutableStateOf(role?.wakeWords?.joinToString(", ").orEmpty()) }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(if (role == null) "添加角色" else "编辑角色") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                if (role != null) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(14.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        AssistantAvatar(
+                            avatarPath = role.avatarPath,
+                            fallbackText = role.displayName.takeLast(1),
+                            modifier = Modifier.size(64.dp),
+                        )
+                        OutlinedButton(onClick = onPickAvatar) { Text("更换头像") }
+                    }
+                }
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("名称") },
+                    singleLine = true,
+                )
+                if (role != null) {
+                    Text("角色形象视频", fontWeight = FontWeight.SemiBold)
+                    DigitalHumanSlot.entries.forEach { slot ->
+                        val configured = role.videoPath(slot).isNotBlank() && File(role.videoPath(slot)).exists()
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Text(if (configured) "${slot.label} · 已配置" else "${slot.label} · 未配置")
+                            Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                OutlinedButton(onClick = { onPickVideo(slot) }) { Text("本机") }
+                                OutlinedButton(onClick = { onStartVideoUpload(slot) }) { Text("扫码") }
+                            }
+                        }
+                    }
+                    Text(
+                        text = if (role.hasCompleteDigitalHuman()) "四段视频已齐全，将启用角色形象" else "需要配置完整四段视频才会启用角色形象",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                OutlinedTextField(
+                    value = wakeWords,
+                    onValueChange = { wakeWords = it },
+                    modifier = Modifier.fillMaxWidth(),
+                    label = { Text("唤醒词") },
+                    supportingText = { Text("多个唤醒词用逗号分隔") },
+                    singleLine = false,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(
+                onClick = { onSave(name, wakeWords) },
+                enabled = name.isNotBlank() && wakeWords.isNotBlank(),
+            ) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
+    )
 }
 
 @Composable
@@ -745,7 +880,7 @@ private fun ComposerCard(
         ) {
             if (state.isRecording || state.isAssistantSpeaking || state.lastSttText.isNotBlank()) {
                 val hint = when {
-                    state.isRecording -> "正在收音，松开或点停止结束"
+                    state.isRecording -> "正在聆听，说完会自动结束"
                     state.isAssistantSpeaking -> "正在播报回复"
                     state.lastSttText.isNotBlank() -> state.lastSttText
                     else -> ""
@@ -764,9 +899,10 @@ private fun ComposerCard(
                 verticalAlignment = Alignment.CenterVertically,
             ) {
                 FilledTonalIconButton(
+                    enabled = state.isRecording || (!state.isAssistantSpeaking && !state.isTurnActive),
                     onClick = {
                         if (state.isRecording) onStopListening()
-                        else onStartListening(ListeningMode.MANUAL)
+                        else onStartListening(ListeningMode.AUTO)
                     },
                 ) {
                     Icon(
@@ -786,7 +922,10 @@ private fun ComposerCard(
                 )
                 FilledIconButton(
                     onClick = onSendDraft,
-                    enabled = state.draftMessage.isNotBlank(),
+                    enabled = state.draftMessage.isNotBlank() &&
+                        !state.isRecording &&
+                        !state.isAssistantSpeaking &&
+                        !state.isTurnActive,
                 ) {
                     Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
                 }
@@ -799,6 +938,7 @@ private fun ComposerCard(
 private fun ChatMessageList(
     messages: List<ChatMessage>,
     assistantAvatarPath: String,
+    assistantAvatarText: String,
     listState: LazyListState,
     modifier: Modifier = Modifier,
 ) {
@@ -807,7 +947,7 @@ private fun ChatMessageList(
             ChatMessage(
                 id = -1,
                 role = ChatRole.ASSISTANT,
-                text = "你好，我在。你可以直接对我说话，也可以打字。",
+                text = "你好，我在。你可以直接对我说话。",
                 timestamp = "",
             ),
         )
@@ -822,13 +962,21 @@ private fun ChatMessageList(
         verticalArrangement = Arrangement.spacedBy(12.dp),
     ) {
         items(displayMessages, key = { it.id }) { message ->
-            ChatBubble(message = message, assistantAvatarPath = assistantAvatarPath)
+            ChatBubble(
+                message = message,
+                assistantAvatarPath = assistantAvatarPath,
+                assistantAvatarText = assistantAvatarText,
+            )
         }
     }
 }
 
 @Composable
-private fun ChatBubble(message: ChatMessage, assistantAvatarPath: String) {
+private fun ChatBubble(
+    message: ChatMessage,
+    assistantAvatarPath: String,
+    assistantAvatarText: String,
+) {
     when (message.role) {
         ChatRole.SYSTEM -> {
             Box(modifier = Modifier.fillMaxWidth(), contentAlignment = Alignment.Center) {
@@ -885,6 +1033,7 @@ private fun ChatBubble(message: ChatMessage, assistantAvatarPath: String) {
             ) {
                 AssistantAvatar(
                     avatarPath = assistantAvatarPath,
+                    fallbackText = assistantAvatarText,
                     modifier = Modifier.size(36.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
@@ -918,6 +1067,7 @@ private fun ChatBubble(message: ChatMessage, assistantAvatarPath: String) {
 @Composable
 private fun AssistantAvatar(
     avatarPath: String,
+    fallbackText: String = "智",
     modifier: Modifier = Modifier,
     onClick: (() -> Unit)? = null,
 ) {
@@ -943,7 +1093,7 @@ private fun AssistantAvatar(
         } else {
             Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
                 Text(
-                    text = "智",
+                    text = fallbackText,
                     style = MaterialTheme.typography.labelLarge,
                     fontWeight = FontWeight.Bold,
                     color = MaterialTheme.colorScheme.onSecondaryContainer,

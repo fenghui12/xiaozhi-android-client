@@ -77,12 +77,30 @@ data class ChatMessage(
     val timestamp: String,
 )
 
+data class ScheduledTaskUi(
+    val id: String,
+    val kind: String,
+    val message: String,
+    val status: String,
+    val remainingSeconds: Long?,
+)
+
 data class UiState(
     val otaUrl: String = "",
     val deviceId: String = "",
     val clientId: String = "",
     val serialNumber: String = "",
     val assistantAvatarPath: String = "",
+    val idleVideoPath: String = "",
+    val greetingVideoPath: String = "",
+    val listeningVideoPath: String = "",
+    val speakingVideoPath: String = "",
+    val activeRoleAvatarPath: String = "",
+    val activeRoleDigitalHumanReady: Boolean = false,
+    val activeRoleIdleVideoPath: String = "",
+    val activeRoleGreetingVideoPath: String = "",
+    val activeRoleListeningVideoPath: String = "",
+    val activeRoleSpeakingVideoPath: String = "",
     val websocketUrl: String = "",
     val authToken: String = "",
     val protocolVersion: String = "1",
@@ -104,6 +122,11 @@ data class UiState(
     val activeListeningMode: String = "",
     val wakeWordEnabled: Boolean = false,
     val wakeWords: String = "",
+    val roleWakeWords: String = "",
+    val activeRoleName: String = "小智",
+    val primaryRoleName: String = "小智",
+    val activeRoleId: String = "xiaozhi",
+    val roleProfiles: List<RoleProfile> = emptyList(),
     val wakeWordStatus: String = "",
     val termuxEnabled: Boolean = false,
     val pythonPath: String = "",
@@ -116,7 +139,9 @@ data class UiState(
     val debugLoggingEnabled: Boolean = false,
     val debugWavDumpEnabled: Boolean = false,
     val connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED,
+    val isSilentTransportRecovery: Boolean = false,
     val draftMessage: String = "",
     val chatMessages: List<ChatMessage> = emptyList(),
+    val scheduledTasks: List<ScheduledTaskUi> = emptyList(),
     val logs: List<LogLine> = emptyList(),
 )

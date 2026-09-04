@@ -65,7 +65,7 @@ class XiaozhiRealtimeClient(private val okHttpClient: OkHttpClient) {
             socketListener(),
         )
 
-        withTimeout(10_000) { handshakeDeferred.await() }
+        withTimeout(20_000) { handshakeDeferred.await() }
     }
 
     fun disconnect(notify: Boolean = true) {
@@ -151,9 +151,7 @@ class XiaozhiRealtimeClient(private val okHttpClient: OkHttpClient) {
         val socket = webSocket ?: return failSend("WebSocket 尚未连接")
         val payload = wrapAudioPayload(opusFrame)
         val success = socket.send(payload.toByteString())
-        if (success) {
-            emit(RealtimeEvent.Log("=> [audio] ${payload.size} bytes"))
-        } else {
+        if (!success) {
             emit(RealtimeEvent.Error("发送音频帧失败"))
         }
         return success
@@ -162,32 +160,55 @@ class XiaozhiRealtimeClient(private val okHttpClient: OkHttpClient) {
     private fun socketListener(): WebSocketListener {
         return object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
+                if (this@XiaozhiRealtimeClient.webSocket != webSocket) {
+                    return
+                }
                 emit(RealtimeEvent.Log("WebSocket 已打开: ${response.code}"))
                 sendHello()
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
+                if (this@XiaozhiRealtimeClient.webSocket != webSocket) {
+                    return
+                }
                 handleTextMessage(text)
             }
 
             override fun onMessage(webSocket: WebSocket, bytes: ByteString) {
+                if (this@XiaozhiRealtimeClient.webSocket != webSocket) {
+                    return
+                }
                 handleBinaryMessage(bytes.toByteArray())
             }
 
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                if (this@XiaozhiRealtimeClient.webSocket != webSocket) {
+                    return
+                }
+                sessionId = null
+                this@XiaozhiRealtimeClient.webSocket = null
                 emit(RealtimeEvent.Log("WebSocket 正在关闭: $code $reason"))
+                emit(RealtimeEvent.Disconnected(code, reason.ifBlank { "server_closing" }))
             }
 
             override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
+                if (this@XiaozhiRealtimeClient.webSocket != webSocket) {
+                    return
+                }
                 sessionId = null
+                this@XiaozhiRealtimeClient.webSocket = null
                 emit(RealtimeEvent.Disconnected(code, reason))
             }
 
             override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                if (this@XiaozhiRealtimeClient.webSocket != webSocket) {
+                    return
+                }
                 if (!handshakeDeferred.isCompleted) {
                     handshakeDeferred.completeExceptionally(t)
                 }
                 sessionId = null
+                this@XiaozhiRealtimeClient.webSocket = null
                 val responseCode = response?.code?.toString() ?: "no-response"
                 emit(RealtimeEvent.Error("WebSocket 失败: $responseCode ${t.message.orEmpty()}"))
             }
@@ -237,7 +258,6 @@ class XiaozhiRealtimeClient(private val okHttpClient: OkHttpClient) {
             return
         }
         emit(RealtimeEvent.BinaryMessage(payload = payload, size = payload.size))
-        emit(RealtimeEvent.Log("<= binary ${payload.size} bytes"))
     }
 
     private fun sendHello() {

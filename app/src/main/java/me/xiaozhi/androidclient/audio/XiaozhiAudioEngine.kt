@@ -1,5 +1,6 @@
 package me.xiaozhi.androidclient.audio
 
+import android.annotation.SuppressLint
 import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioDeviceCallback
@@ -12,6 +13,7 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
+import android.util.Log
 import io.github.jaredmdobson.concentus.OpusApplication
 import io.github.jaredmdobson.concentus.OpusDecoder
 import io.github.jaredmdobson.concentus.OpusEncoder
@@ -412,6 +414,7 @@ class XiaozhiAudioEngine(context: Context) {
         }
     }
 
+    @SuppressLint("MissingPermission")
     private fun createAudioRecord(): AudioRecord? {
         val bufferSize = max(
             AudioRecord.getMinBufferSize(
@@ -423,8 +426,8 @@ class XiaozhiAudioEngine(context: Context) {
         )
 
         val candidates = listOf(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
             MediaRecorder.AudioSource.VOICE_RECOGNITION,
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,
             MediaRecorder.AudioSource.MIC,
         )
 
@@ -442,6 +445,8 @@ class XiaozhiAudioEngine(context: Context) {
                     .setBufferSizeInBytes(bufferSize)
                     .build()
                 if (record.state == AudioRecord.STATE_INITIALIZED) {
+                    applyPreferredInputDevice(record)
+                    Log.d("XiaozhiClient", "[CAPTURE] AudioRecord initialized source=$source bufferSize=$bufferSize")
                     return record
                 }
                 record.release()
@@ -483,7 +488,7 @@ class XiaozhiAudioEngine(context: Context) {
         val attributesBuilder = AudioAttributes.Builder()
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
             .setUsage(AudioAttributes.USAGE_MEDIA)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S_V2) {
             attributesBuilder.setSpatializationBehavior(
                 AudioAttributes.SPATIALIZATION_BEHAVIOR_NEVER,
             )
@@ -520,6 +525,7 @@ class XiaozhiAudioEngine(context: Context) {
         }
         findPreferredInputDevice()?.let { device ->
             runCatching { audioRecord.preferredDevice = device }
+            Log.d("XiaozhiClient", "[CAPTURE] preferred input device=${device.productName} type=${device.type}")
         }
     }
 
@@ -534,7 +540,8 @@ class XiaozhiAudioEngine(context: Context) {
             return null
         }
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-        return devices.firstOrNull(::isWiredInputDevice)
+        return devices.firstOrNull(::isUsbInputDevice)
+            ?: devices.firstOrNull(::isWiredInputDevice)
             ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
             ?: devices.firstOrNull(::isBluetoothInputDevice)
             ?: devices.firstOrNull()
@@ -568,7 +575,7 @@ class XiaozhiAudioEngine(context: Context) {
         return when {
             device == null -> "机身麦克风"
             isBluetoothInputDevice(device) -> "蓝牙麦克风"
-            device.type == AudioDeviceInfo.TYPE_USB_HEADSET -> "USB 麦克风"
+            isUsbInputDevice(device) -> "USB 麦克风"
             isWiredInputDevice(device) -> "耳机麦克风"
             device.type == AudioDeviceInfo.TYPE_BUILTIN_MIC -> "机身麦克风"
             else -> "机身麦克风"
@@ -595,6 +602,11 @@ class XiaozhiAudioEngine(context: Context) {
     private fun isWiredInputDevice(device: AudioDeviceInfo): Boolean {
         return device.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
             device.type == AudioDeviceInfo.TYPE_USB_HEADSET
+    }
+
+    private fun isUsbInputDevice(device: AudioDeviceInfo): Boolean {
+        return device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
+            device.type == AudioDeviceInfo.TYPE_USB_DEVICE
     }
 
     private fun isSpeakerDevice(device: AudioDeviceInfo): Boolean {

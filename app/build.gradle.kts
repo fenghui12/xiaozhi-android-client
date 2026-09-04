@@ -88,7 +88,10 @@ dependencies {
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("io.github.jaredmdobson:concentus:1.0.2")
     implementation("io.coil-kt:coil-compose:2.7.0")
+    implementation("com.belerweb:pinyin4j:2.5.1")
+    implementation("com.google.zxing:core:3.5.3")
 
+    testImplementation("junit:junit:4.13.2")
     debugImplementation("androidx.compose.ui:ui-tooling")
     debugImplementation("androidx.compose.ui:ui-test-manifest")
 }

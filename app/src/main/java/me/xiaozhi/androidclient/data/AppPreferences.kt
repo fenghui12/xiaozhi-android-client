@@ -11,12 +11,18 @@ private const val KEY_OTA_URL = "ota_url"
 private const val KEY_DEVICE_ID = "device_id"
 private const val KEY_CLIENT_ID = "client_id"
 private const val KEY_ASSISTANT_AVATAR_PATH = "assistant_avatar_path"
+private const val KEY_IDLE_VIDEO_PATH = "idle_video_path"
+private const val KEY_GREETING_VIDEO_PATH = "greeting_video_path"
+private const val KEY_LISTENING_VIDEO_PATH = "listening_video_path"
+private const val KEY_SPEAKING_VIDEO_PATH = "speaking_video_path"
 private const val KEY_WEBSOCKET_URL = "websocket_url"
 private const val KEY_AUTH_TOKEN = "auth_token"
 private const val KEY_PROTOCOL_VERSION = "protocol_version"
 private const val KEY_MCP_PAYLOAD = "mcp_payload"
 private const val KEY_WAKE_WORD_ENABLED = "wake_word_enabled"
 private const val KEY_WAKE_WORDS = "wake_words"
+private const val KEY_PRIMARY_ROLE_NAME = "primary_role_name"
+private const val KEY_ACTIVE_ROLE_ID = "active_role_id"
 private const val KEY_TERMUX_ENABLED = "termux_enabled"
 private const val KEY_PYTHON_PATH = "python_path"
 private const val KEY_PYTHON_SCRIPT_PATH = "python_script_path"
@@ -39,12 +45,18 @@ data class StoredConfig(
     val deviceId: String,
     val clientId: String,
     val assistantAvatarPath: String,
+    val idleVideoPath: String,
+    val greetingVideoPath: String,
+    val listeningVideoPath: String,
+    val speakingVideoPath: String,
     val websocketUrl: String,
     val authToken: String,
     val protocolVersion: String,
     val mcpPayload: String,
     val wakeWordEnabled: Boolean,
     val wakeWords: String,
+    val primaryRoleName: String,
+    val activeRoleId: String,
     val termuxEnabled: Boolean,
     val pythonPath: String,
     val pythonScriptPath: String,
@@ -72,6 +84,10 @@ class AppPreferences(private val context: Context) {
             deviceId = deviceId,
             clientId = clientId,
             assistantAvatarPath = prefs.getString(KEY_ASSISTANT_AVATAR_PATH, "") ?: "",
+            idleVideoPath = prefs.getString(KEY_IDLE_VIDEO_PATH, "") ?: "",
+            greetingVideoPath = prefs.getString(KEY_GREETING_VIDEO_PATH, "") ?: "",
+            listeningVideoPath = prefs.getString(KEY_LISTENING_VIDEO_PATH, "") ?: "",
+            speakingVideoPath = prefs.getString(KEY_SPEAKING_VIDEO_PATH, "") ?: "",
             websocketUrl = prefs.getString(KEY_WEBSOCKET_URL, "") ?: "",
             authToken = prefs.getString(KEY_AUTH_TOKEN, "") ?: "",
             protocolVersion = prefs.getString(
@@ -81,6 +97,8 @@ class AppPreferences(private val context: Context) {
             mcpPayload = prefs.getString(KEY_MCP_PAYLOAD, DEFAULT_MCP_PAYLOAD) ?: DEFAULT_MCP_PAYLOAD,
             wakeWordEnabled = prefs.getBoolean(KEY_WAKE_WORD_ENABLED, false),
             wakeWords = prefs.getString(KEY_WAKE_WORDS, DEFAULT_WAKE_WORDS) ?: DEFAULT_WAKE_WORDS,
+            primaryRoleName = prefs.getString(KEY_PRIMARY_ROLE_NAME, "小智") ?: "小智",
+            activeRoleId = prefs.getString(KEY_ACTIVE_ROLE_ID, "xiaozhi") ?: "xiaozhi",
             termuxEnabled = prefs.getBoolean(KEY_TERMUX_ENABLED, false),
             pythonPath = prefs.getString(KEY_PYTHON_PATH, DEFAULT_PYTHON_PATH) ?: DEFAULT_PYTHON_PATH,
             pythonScriptPath = prefs.getString(KEY_PYTHON_SCRIPT_PATH, "") ?: "",
@@ -99,12 +117,18 @@ class AppPreferences(private val context: Context) {
             .putString(KEY_DEVICE_ID, config.deviceId)
             .putString(KEY_CLIENT_ID, config.clientId)
             .putString(KEY_ASSISTANT_AVATAR_PATH, config.assistantAvatarPath)
+            .putString(KEY_IDLE_VIDEO_PATH, config.idleVideoPath)
+            .putString(KEY_GREETING_VIDEO_PATH, config.greetingVideoPath)
+            .putString(KEY_LISTENING_VIDEO_PATH, config.listeningVideoPath)
+            .putString(KEY_SPEAKING_VIDEO_PATH, config.speakingVideoPath)
             .putString(KEY_WEBSOCKET_URL, config.websocketUrl)
             .putString(KEY_AUTH_TOKEN, config.authToken)
             .putString(KEY_PROTOCOL_VERSION, config.protocolVersion)
             .putString(KEY_MCP_PAYLOAD, config.mcpPayload)
             .putBoolean(KEY_WAKE_WORD_ENABLED, config.wakeWordEnabled)
             .putString(KEY_WAKE_WORDS, config.wakeWords)
+            .putString(KEY_PRIMARY_ROLE_NAME, config.primaryRoleName)
+            .putString(KEY_ACTIVE_ROLE_ID, config.activeRoleId)
             .putBoolean(KEY_TERMUX_ENABLED, config.termuxEnabled)
             .putString(KEY_PYTHON_PATH, config.pythonPath)
             .putString(KEY_PYTHON_SCRIPT_PATH, config.pythonScriptPath)
