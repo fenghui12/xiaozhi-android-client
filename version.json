@@ -1,9 +1,9 @@
 {
-  "versionCode": 4,
-  "versionName": "1.2.0",
+  "versionCode": 5,
+  "versionName": "1.2.1",
   "minSupportVersion": 1,
-  "downloadUrl": "http://192.168.5.163:8998/xiaozhi-v1.2.0.apk",
-  "sha256": "2b8c3dc2100e336628344754c14e6eafc2701ffb43bc6382ba22dbf64d1ba786",
+  "downloadUrl": "https://ghfast.top/https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.1/xiaozhi-v1.2.1.apk",
+  "sha256": "4c3b168f3022839ff0fc9166b3387e666d0ab18240ed4fcb918ae1de7bb8beb7",
   "forceUpdate": false,
-  "releaseNotes": "1. 局域网极速OTA在线升级全链路实测\n2. 验证版本比对、断点流式下载与完整性哈希校验\n3. 验证自动覆盖安装与生命周期恢复"
+  "releaseNotes": "1. 远程OTA生产验证：手动检查更新与静默升级闭环\n2. 默认启用国内CDN多节点加速镜像\n3. 优化RK3568系统级静默覆盖与主进程守护恢复"
 }
