@@ -3,7 +3,7 @@
   "versionName": "1.2.2",
   "minSupportVersion": 1,
   "downloadUrl": "https://ghfast.top/https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.2/xiaozhi-v1.2.2.apk",
-  "sha256": "2efc54e9c64bcf0c7ca14aa8f59d65163bbf6f79091bc245cb7eb14263c8381c",
+  "sha256": "5fd28802f5531b2c770fb1879039c681f58ddae2ec61a05e43840c8be2585e35",
   "forceUpdate": false,
   "releaseNotes": "1. 修复删除角色时覆盖最新配置的问题\n2. 删除角色时同步清理头像和数字人视频资源\n3. 优化 OTA 检查并发控制、响应释放和失败下载清理"
 }
