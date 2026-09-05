@@ -95,7 +95,7 @@ class AppPreferences(private val context: Context) {
                 DEFAULT_PROTOCOL_VERSION,
             ) ?: DEFAULT_PROTOCOL_VERSION,
             mcpPayload = prefs.getString(KEY_MCP_PAYLOAD, DEFAULT_MCP_PAYLOAD) ?: DEFAULT_MCP_PAYLOAD,
-            wakeWordEnabled = prefs.getBoolean(KEY_WAKE_WORD_ENABLED, false),
+            wakeWordEnabled = prefs.getBoolean(KEY_WAKE_WORD_ENABLED, true),
             wakeWords = prefs.getString(KEY_WAKE_WORDS, DEFAULT_WAKE_WORDS) ?: DEFAULT_WAKE_WORDS,
             primaryRoleName = prefs.getString(KEY_PRIMARY_ROLE_NAME, "小智") ?: "小智",
             activeRoleId = prefs.getString(KEY_ACTIVE_ROLE_ID, "xiaozhi") ?: "xiaozhi",

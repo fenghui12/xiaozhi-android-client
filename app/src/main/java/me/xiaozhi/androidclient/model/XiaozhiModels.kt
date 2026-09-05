@@ -120,7 +120,7 @@ data class UiState(
     val isAssistantSpeaking: Boolean = false,
     val isTurnActive: Boolean = false,
     val activeListeningMode: String = "",
-    val wakeWordEnabled: Boolean = false,
+    val wakeWordEnabled: Boolean = true,
     val wakeWords: String = "",
     val roleWakeWords: String = "",
     val activeRoleName: String = "小智",

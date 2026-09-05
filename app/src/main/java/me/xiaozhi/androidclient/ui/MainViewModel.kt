@@ -422,6 +422,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     roleProfiles = emptyList(),
                 )
             }
+            preferences.save(storedConfig.copy(primaryRoleName = "", wakeWords = "", deviceId = "", clientId = "", websocketUrl = "", authToken = "", activeRoleId = ""))
             roleProfiles = emptyList()
             addLog("已删除角色：小智")
             userRequestedDisconnect = false
