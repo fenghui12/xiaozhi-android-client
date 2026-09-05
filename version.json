@@ -3,7 +3,7 @@
   "versionName": "1.2.0",
   "minSupportVersion": 1,
   "downloadUrl": "http://192.168.5.163:8998/xiaozhi-v1.2.0.apk",
-  "sha256": "145a2959926bb73e924dd8490b0cb873fb5359c20b92ee079449f30a30cf8df2",
+  "sha256": "2b8c3dc2100e336628344754c14e6eafc2701ffb43bc6382ba22dbf64d1ba786",
   "forceUpdate": false,
   "releaseNotes": "1. 局域网极速OTA在线升级全链路实测\n2. 验证版本比对、断点流式下载与完整性哈希校验\n3. 验证自动覆盖安装与生命周期恢复"
 }
