@@ -1,9 +1,9 @@
 {
-  "versionCode": 5,
-  "versionName": "1.2.1",
+  "versionCode": 6,
+  "versionName": "1.2.2",
   "minSupportVersion": 1,
-  "downloadUrl": "https://ghfast.top/https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.1/xiaozhi-v1.2.1.apk",
-  "sha256": "4c3b168f3022839ff0fc9166b3387e666d0ab18240ed4fcb918ae1de7bb8beb7",
+  "downloadUrl": "https://ghfast.top/https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.2/xiaozhi-v1.2.2.apk",
+  "sha256": "2efc54e9c64bcf0c7ca14aa8f59d65163bbf6f79091bc245cb7eb14263c8381c",
   "forceUpdate": false,
-  "releaseNotes": "1. 远程OTA生产验证：手动检查更新与静默升级闭环\n2. 默认启用国内CDN多节点加速镜像\n3. 优化RK3568系统级静默覆盖与主进程守护恢复"
+  "releaseNotes": "1. 修复删除角色时覆盖最新配置的问题\n2. 删除角色时同步清理头像和数字人视频资源\n3. 优化 OTA 检查并发控制、响应释放和失败下载清理"
 }

@@ -121,6 +121,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var conversationLoopActive: Boolean = false
     private var scheduledResumeCancelledByUser: Boolean = false
     private var ignoreLifecycleGoodbyeAfterScheduledDelivery: Boolean = false
+    private var appUpdateCheckJob: Job? = null
     private val pendingTextPrompts = ArrayDeque<String>()
     private val pendingScheduledPrompts = ArrayDeque<ScheduledPrompt>()
     private var activeScheduledPrompt: ScheduledPrompt? = null
@@ -279,29 +280,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun checkForAppUpdate(silent: Boolean = false) {
-        if (_uiState.value.isCheckingUpdate || _uiState.value.isDownloadingUpdate) return
-        viewModelScope.launch {
+        if (appUpdateCheckJob?.isActive == true || _uiState.value.isDownloadingUpdate) return
+        appUpdateCheckJob = viewModelScope.launch {
             if (!silent) {
                 _uiState.update { it.copy(isCheckingUpdate = true, updateCheckStatus = "正在检查更新...") }
             }
-            val currentCode = _uiState.value.appVersionCode
-            when (val result = appUpdateManager.checkForUpdate(currentCode)) {
-                is me.xiaozhi.androidclient.ota.UpdateCheckResult.UpToDate -> {
-                    if (!silent) {
-                        _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "已是最新版本 (v${it.appVersionName})", availableUpdate = null) }
-                        addLog("检查更新：当前已是最新版本")
+            try {
+                val currentCode = _uiState.value.appVersionCode
+                when (val result = appUpdateManager.checkForUpdate(currentCode)) {
+                    is me.xiaozhi.androidclient.ota.UpdateCheckResult.UpToDate -> {
+                        if (!silent) {
+                            _uiState.update { it.copy(updateCheckStatus = "已是最新版本 (v${it.appVersionName})", availableUpdate = null) }
+                            addLog("检查更新：当前已是最新版本")
+                        }
+                    }
+                    is me.xiaozhi.androidclient.ota.UpdateCheckResult.HasUpdate -> {
+                        _uiState.update { it.copy(updateCheckStatus = "发现新版本 v${result.info.versionName}", availableUpdate = result.info) }
+                        addLog("发现新版本：v${result.info.versionName} (${result.info.releaseNotes.replace('\n', ' ')})")
+                    }
+                    is me.xiaozhi.androidclient.ota.UpdateCheckResult.Error -> {
+                        if (!silent) {
+                            _uiState.update { it.copy(updateCheckStatus = "检查更新失败: ${result.message}") }
+                            addLog("检查更新失败：${result.message}")
+                        }
                     }
                 }
-                is me.xiaozhi.androidclient.ota.UpdateCheckResult.HasUpdate -> {
-                    _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "发现新版本 v${result.info.versionName}", availableUpdate = result.info) }
-                    addLog("发现新版本：v${result.info.versionName} (${result.info.releaseNotes.replace('\n', ' ')})")
-                }
-                is me.xiaozhi.androidclient.ota.UpdateCheckResult.Error -> {
-                    if (!silent) {
-                        _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "检查更新失败: ${result.message}") }
-                        addLog("检查更新失败：${result.message}")
-                    }
-                }
+            } finally {
+                _uiState.update { it.copy(isCheckingUpdate = false) }
+                appUpdateCheckJob = null
             }
         }
     }
@@ -333,7 +339,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
 
-            val downloadResult = appUpdateManager.downloadApk(updateInfo) { apkFile ->
+            appUpdateManager.downloadApk(updateInfo) { apkFile ->
                 addLog("安装包校验通过，启动安装...")
                 val installed = appUpdateManager.installApk(apkFile)
                 if (!installed) {
@@ -413,6 +419,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun deleteRole(roleId: String) {
         if (roleId == RoleProfileRepository.DEFAULT_ROLE_ID) {
+            val avatarPath = uiState.value.assistantAvatarPath
             userRequestedDisconnect = true
             cancelReconnect()
             realtimeClient.disconnect(notify = false)
@@ -431,13 +438,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     roleProfiles = emptyList(),
                 )
             }
-            preferences.save(storedConfig.copy(primaryRoleName = "", wakeWords = "", deviceId = "", clientId = "", websocketUrl = "", authToken = "", activeRoleId = ""))
+            digitalHumanAssets.deleteRoleAssets(roleId)
+            deleteFileIfOwned(avatarPath)
             roleProfiles = emptyList()
             addLog("已删除角色：小智")
             userRequestedDisconnect = false
             return
         }
+        val removedRole = roleProfiles.firstOrNull { it.id == roleId }
         saveAdditionalProfiles(roleProfiles.filterNot { it.id == roleId })
+        removedRole?.let {
+            digitalHumanAssets.deleteRoleAssets(it.id)
+            deleteFileIfOwned(it.avatarPath)
+        }
         if (activeRoleId == roleId) {
             val next = roleProfiles.firstOrNull { it.id != roleId }
             if (next != null) selectRole(next.id) else {
@@ -545,7 +558,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             addLog(message)
         }.onFailure { error ->
             refreshPythonRuntimeStatus()
-            addLog("璋冪敤 termux-api 澶辫触锛?{error.message.orEmpty()}")
+            addLog("调用 termux-api 失败：${error.message.orEmpty()}")
         }
     }
 
@@ -2082,6 +2095,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         Log.d(LOG_TAG, "[$timestamp] $message")
         updateState {
             copy(logs = (logs + LogLine(timestamp, message)).takeLast(300))
+        }
+    }
+
+    private fun deleteFileIfOwned(path: String) {
+        if (path.isBlank()) return
+        val file = File(path)
+        val appFiles = getApplication<Application>().filesDir.canonicalFile
+        runCatching {
+            if (file.canonicalFile.toPath().startsWith(appFiles.toPath())) {
+                file.delete()
+            }
         }
     }
 

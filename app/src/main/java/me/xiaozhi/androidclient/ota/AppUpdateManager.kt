@@ -53,7 +53,7 @@ class AppUpdateManager(
                         .header("Cache-Control", "no-cache")
                         .build()
 
-                    val response = httpClient.newCall(request).execute()
+                    httpClient.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
                         val body = response.body?.string()
                         if (!body.isNullOrBlank()) {
@@ -81,6 +81,7 @@ class AppUpdateManager(
                         }
                     } else {
                         lastErrorMsg = "HTTP ${response.code}"
+                    }
                     }
                 } catch (e: Exception) {
                     lastErrorMsg = e.message ?: "网络连接异常"
@@ -114,9 +115,7 @@ class AppUpdateManager(
                 try {
                     android.util.Log.d("AppUpdateManager", "Trying to download APK from: $url")
                     finalApkFile = attemptDownload(url, info)
-                    if (finalApkFile != null) {
-                        break
-                    }
+                    break
                 } catch (e: Exception) {
                     android.util.Log.w("AppUpdateManager", "Download failed from $url: ${e.message}")
                     lastError = e
@@ -148,22 +147,23 @@ class AppUpdateManager(
             .url(url)
             .header("User-Agent", "Mozilla/5.0 (Linux; Android 11) XiaozhiClient/1.1.0")
             .build()
-        val response = httpClient.newCall(request).execute()
-        if (!response.isSuccessful) {
-            throw IllegalStateException("HTTP ${response.code}")
-        }
+        return httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IllegalStateException("HTTP ${response.code}")
+            }
 
-        val body = response.body ?: throw IllegalStateException("下载内容为空")
-        val totalBytes = body.contentLength()
-        val cacheDir = File(context.cacheDir, "updates").apply { mkdirs() }
-        val apkFile = File(cacheDir, "xiaozhi-update-${info.versionCode}.apk")
-        if (apkFile.exists()) apkFile.delete()
+            val body = response.body ?: throw IllegalStateException("下载内容为空")
+            val totalBytes = body.contentLength()
+            val cacheDir = File(context.cacheDir, "updates").apply { mkdirs() }
+            val apkFile = File(cacheDir, "xiaozhi-update-${info.versionCode}.apk")
+            if (apkFile.exists()) apkFile.delete()
 
-        val input: InputStream = body.byteStream()
-        val output = FileOutputStream(apkFile)
+            val input: InputStream = body.byteStream()
+            val output = FileOutputStream(apkFile)
 
-        input.use { inStream ->
-            output.use { outStream ->
+            try {
+                input.use { inStream ->
+                    output.use { outStream ->
                 val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
                 var bytesDownloaded = 0L
                 var lastPercent = 0
@@ -181,9 +181,14 @@ class AppUpdateManager(
                         }
                     }
                 }
+                    }
+                }
+            } catch (error: Throwable) {
+                apkFile.delete()
+                throw error
             }
+            apkFile
         }
-        return apkFile
     }
 
     fun installApk(apkFile: File): Boolean {
