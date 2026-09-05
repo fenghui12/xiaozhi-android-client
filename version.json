@@ -1,0 +1,9 @@
+{
+  "versionCode": 3,
+  "versionName": "1.1.0",
+  "minSupportVersion": 1,
+  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.1.0-stable/app-debug.apk",
+  "sha256": "b1738d745befec486241be1cab0191ab1484bf7db0f4f9f643a308dd8df58b9e",
+  "forceUpdate": false,
+  "releaseNotes": "1. 支持同 WiFi 局域网扫码上传数字人四状态视频\n2. 补齐网络与WiFi状态权限，优化服务稳定性\n3. 支持多角色自定义离线拼音唤醒词与独立视频配置\n4. 支持开机自启守护与定时监督调度"
+}

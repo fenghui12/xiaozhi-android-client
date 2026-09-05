@@ -97,6 +97,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         .writeTimeout(30, TimeUnit.SECONDS)
         .pingInterval(30, TimeUnit.SECONDS)
         .build()
+    val appUpdateManager = me.xiaozhi.androidclient.ota.AppUpdateManager(application, okHttpClient)
     private val otaConfigService = OtaConfigService(okHttpClient)
     private val realtimeClient = XiaozhiRealtimeClient(okHttpClient)
     private val networkTimeSynchronizer = NetworkTimeSynchronizer()
@@ -272,6 +273,68 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             })
         }
         reloadRoleProfiles()
+    }
+
+    fun checkForAppUpdate() {
+        if (_uiState.value.isCheckingUpdate || _uiState.value.isDownloadingUpdate) return
+        viewModelScope.launch {
+            _uiState.update { it.copy(isCheckingUpdate = true, updateCheckStatus = "正在检查更新...") }
+            val currentCode = _uiState.value.appVersionCode
+            when (val result = appUpdateManager.checkForUpdate(currentCode)) {
+                is me.xiaozhi.androidclient.ota.UpdateCheckResult.UpToDate -> {
+                    _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "已是最新版本 (v${it.appVersionName})", availableUpdate = null) }
+                    addLog("检查更新：当前已是最新版本")
+                }
+                is me.xiaozhi.androidclient.ota.UpdateCheckResult.HasUpdate -> {
+                    _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "发现新版本 v${result.info.versionName}", availableUpdate = result.info) }
+                    addLog("发现新版本：v${result.info.versionName} (${result.info.releaseNotes.replace('\n', ' ')})")
+                }
+                is me.xiaozhi.androidclient.ota.UpdateCheckResult.Error -> {
+                    _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "检查更新失败: ${result.message}") }
+                    addLog("检查更新失败：${result.message}")
+                }
+            }
+        }
+    }
+
+    fun startDownloadAndInstallUpdate() {
+        val updateInfo = _uiState.value.availableUpdate ?: return
+        if (_uiState.value.isDownloadingUpdate) return
+
+        viewModelScope.launch {
+            _uiState.update { it.copy(isDownloadingUpdate = true, downloadProgressPercent = 0) }
+            val downloadJob = launch {
+                appUpdateManager.downloadState.collect { progress ->
+                    when (progress) {
+                        is me.xiaozhi.androidclient.ota.DownloadProgressState.Downloading -> {
+                            _uiState.update { it.copy(downloadProgressPercent = progress.progressPercent) }
+                        }
+                        is me.xiaozhi.androidclient.ota.DownloadProgressState.Verifying -> {
+                            _uiState.update { it.copy(updateCheckStatus = "正在校验安装包完整性...") }
+                        }
+                        is me.xiaozhi.androidclient.ota.DownloadProgressState.ReadyToInstall -> {
+                            _uiState.update { it.copy(updateCheckStatus = "下载完成，正在安装...") }
+                        }
+                        is me.xiaozhi.androidclient.ota.DownloadProgressState.Failed -> {
+                            _uiState.update { it.copy(isDownloadingUpdate = false, updateCheckStatus = "更新失败: ${progress.error}") }
+                            addLog("升级下载失败: ${progress.error}")
+                        }
+                        else -> {}
+                    }
+                }
+            }
+
+            val downloadResult = appUpdateManager.downloadApk(updateInfo) { apkFile ->
+                addLog("安装包校验通过，启动安装...")
+                val installed = appUpdateManager.installApk(apkFile)
+                if (!installed) {
+                    addLog("调用系统安装失败，请检查安装权限")
+                }
+            }
+
+            downloadJob.cancel()
+            _uiState.update { it.copy(isDownloadingUpdate = false) }
+        }
     }
 
     fun updateWakeWordEnabled(enabled: Boolean) {

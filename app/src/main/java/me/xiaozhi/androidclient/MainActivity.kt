@@ -50,6 +50,8 @@ import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
@@ -291,6 +293,8 @@ private fun XiaozhiApp() {
         onAddRole = viewModel::addRole,
         onUpdateRole = viewModel::updateRole,
         onDeleteRole = viewModel::deleteRole,
+        onCheckForUpdate = viewModel::checkForAppUpdate,
+        onStartUpdate = viewModel::startDownloadAndInstallUpdate,
         onStartVideoUpload = { roleId, slot ->
             latestState.roleProfiles.firstOrNull { it.id == roleId }?.let { role ->
                 runCatching {
@@ -333,6 +337,8 @@ private fun XiaozhiScreen(
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
     onDeleteRole: (String) -> Unit,
+    onCheckForUpdate: () -> Unit,
+    onStartUpdate: () -> Unit,
     onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
 ) {
     Scaffold(
@@ -371,6 +377,8 @@ private fun XiaozhiScreen(
                 onAddRole = onAddRole,
                 onUpdateRole = onUpdateRole,
                 onDeleteRole = onDeleteRole,
+                onCheckForUpdate = onCheckForUpdate,
+                onStartUpdate = onStartUpdate,
                 onStartVideoUpload = onStartVideoUpload,
             )
         }
@@ -643,6 +651,8 @@ private fun SettingsScreen(
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
     onDeleteRole: (String) -> Unit,
+    onCheckForUpdate: () -> Unit,
+    onStartUpdate: () -> Unit,
     onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
 ) {
     val scrollState = rememberScrollState()
@@ -666,6 +676,115 @@ private fun SettingsScreen(
             onUpdateRole = onUpdateRole,
             onDeleteRole = onDeleteRole,
         )
+
+        AppUpdateCard(
+            state = state,
+            onCheckForUpdate = onCheckForUpdate,
+            onStartUpdate = onStartUpdate,
+        )
+    }
+}
+
+@Composable
+private fun AppUpdateCard(
+    state: UiState,
+    onCheckForUpdate: () -> Unit,
+    onStartUpdate: () -> Unit,
+) {
+    Surface(
+        color = Color.White,
+        shape = RoundedCornerShape(24.dp),
+        shadowElevation = 2.dp,
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(20.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Column {
+                    Text(
+                        text = "系统与软件更新",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
+                    Text(
+                        text = "当前版本：v${state.appVersionName} (Build ${state.appVersionCode})",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+                Button(
+                    onClick = onCheckForUpdate,
+                    enabled = !state.isCheckingUpdate && !state.isDownloadingUpdate,
+                ) {
+                    Text(if (state.isCheckingUpdate) "检查中..." else "检查更新")
+                }
+            }
+
+            if (state.updateCheckStatus.isNotBlank()) {
+                Text(
+                    text = state.updateCheckStatus,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.primary,
+                )
+            }
+
+            if (state.availableUpdate != null) {
+                Surface(
+                    color = Color(0xFFF0FDF4),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color(0xFFBBF7D0)),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "🎉 发现新版本 v${state.availableUpdate.versionName}",
+                            fontWeight = FontWeight.Bold,
+                            color = Color(0xFF166534),
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                        if (state.availableUpdate.releaseNotes.isNotBlank()) {
+                            Text(
+                                text = state.availableUpdate.releaseNotes,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = Color(0xFF15803D),
+                            )
+                        }
+
+                        if (state.isDownloadingUpdate) {
+                            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                                LinearProgressIndicator(
+                                    progress = { state.downloadProgressPercent / 100f },
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                                Text(
+                                    text = "下载更新中 ${state.downloadProgressPercent}%",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Color(0xFF166534),
+                                )
+                            }
+                        } else {
+                            Button(
+                                onClick = onStartUpdate,
+                                colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF16A34A)),
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("立即下载并安装更新")
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 

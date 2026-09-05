@@ -143,5 +143,12 @@ data class UiState(
     val draftMessage: String = "",
     val chatMessages: List<ChatMessage> = emptyList(),
     val scheduledTasks: List<ScheduledTaskUi> = emptyList(),
+    val appVersionName: String = "1.1.0",
+    val appVersionCode: Int = 3,
+    val updateCheckStatus: String = "",
+    val availableUpdate: me.xiaozhi.androidclient.ota.OtaVersionInfo? = null,
+    val isCheckingUpdate: Boolean = false,
+    val isDownloadingUpdate: Boolean = false,
+    val downloadProgressPercent: Int = 0,
     val logs: List<LogLine> = emptyList(),
 )
