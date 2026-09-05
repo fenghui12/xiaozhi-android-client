@@ -1,9 +1,9 @@
 {
-  "versionCode": 3,
-  "versionName": "1.1.0",
+  "versionCode": 4,
+  "versionName": "1.2.0",
   "minSupportVersion": 1,
-  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.1.0-stable/app-debug.apk",
-  "sha256": "b1738d745befec486241be1cab0191ab1484bf7db0f4f9f643a308dd8df58b9e",
+  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.0-test/xiaozhi-v1.2.0.apk",
+  "sha256": "2b8c3dc2100e336628344754c14e6eafc2701ffb43bc6382ba22dbf64d1ba786",
   "forceUpdate": false,
-  "releaseNotes": "1. 支持同 WiFi 局域网扫码上传数字人四状态视频\n2. 补齐网络与WiFi状态权限，优化服务稳定性\n3. 支持多角色自定义离线拼音唤醒词与独立视频配置\n4. 支持开机自启守护与定时监督调度"
+  "releaseNotes": "1. 远程OTA在线升级与自检链路全流程测试\n2. 验证版本比对、断点流式下载与完整性哈希校验\n3. 验证自动覆盖安装与生命周期恢复"
 }
