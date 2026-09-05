@@ -73,7 +73,7 @@ class AppUpdateManagerTest {
         val dummyContext = android.app.Application()
         val updateManager = AppUpdateManager(
             context = dummyContext,
-            httpClient = httpClient,
+            baseHttpClient = httpClient,
             updateIndexUrl = "http://127.0.0.1:${serverSocket!!.localPort}/version.json",
         )
 
@@ -99,7 +99,7 @@ class AppUpdateManagerTest {
         val dummyContext = android.app.Application()
         val updateManager = AppUpdateManager(
             context = dummyContext,
-            httpClient = httpClient,
+            baseHttpClient = httpClient,
             updateIndexUrl = "http://127.0.0.1:${serverSocket!!.localPort}/version.json",
         )
 

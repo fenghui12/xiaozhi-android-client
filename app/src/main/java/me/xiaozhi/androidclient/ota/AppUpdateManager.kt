@@ -20,9 +20,17 @@ import org.json.JSONObject
 
 class AppUpdateManager(
     private val context: Context,
-    private val httpClient: OkHttpClient,
+    private val baseHttpClient: OkHttpClient,
     private val updateIndexUrl: String = DEFAULT_UPDATE_INDEX_URL,
 ) {
+    private val httpClient = baseHttpClient.newBuilder()
+        .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
     private val _downloadState = MutableStateFlow<DownloadProgressState>(DownloadProgressState.Idle)
     val downloadState: StateFlow<DownloadProgressState> = _downloadState.asStateFlow()
 
@@ -31,40 +39,54 @@ class AppUpdateManager(
 
     suspend fun checkForUpdate(currentVersionCode: Int): UpdateCheckResult = withContext(Dispatchers.IO) {
         runCatching {
-            val request = Request.Builder()
-                .url(updateIndexUrl)
-                .header("Cache-Control", "no-cache")
-                .build()
+            val candidateIndexUrls = listOf(
+                updateIndexUrl,
+                "https://ghfast.top/$updateIndexUrl",
+                "https://gh-proxy.com/$updateIndexUrl"
+            )
 
-            val response = httpClient.newCall(request).execute()
-            if (!response.isSuccessful) {
-                return@withContext UpdateCheckResult.Error("检测更新失败 (HTTP ${response.code})")
+            var lastErrorMsg = "检测更新失败"
+            for (url in candidateIndexUrls) {
+                try {
+                    val request = Request.Builder()
+                        .url(url)
+                        .header("Cache-Control", "no-cache")
+                        .build()
+
+                    val response = httpClient.newCall(request).execute()
+                    if (response.isSuccessful) {
+                        val body = response.body?.string()
+                        if (!body.isNullOrBlank()) {
+                            val json = JSONObject(body)
+                            val remoteVersionCode = if (json.has("versionCode")) json.optInt("versionCode", 0) else 0
+                            val remoteVersionName = if (json.has("versionName")) (json.optString("versionName", "") ?: "") else ""
+                            val downloadUrl = if (json.has("downloadUrl")) (json.optString("downloadUrl", "") ?: "") else ""
+                            val sha256 = (if (json.has("sha256")) (json.optString("sha256", "") ?: "") else "").trim().lowercase()
+                            val releaseNotes = if (json.has("releaseNotes")) (json.optString("releaseNotes", "") ?: "") else ""
+                            val forceUpdate = json.optBoolean("forceUpdate", false)
+
+                            if (remoteVersionCode > currentVersionCode && downloadUrl.isNotBlank()) {
+                                val info = OtaVersionInfo(
+                                    versionCode = remoteVersionCode,
+                                    versionName = remoteVersionName,
+                                    downloadUrl = downloadUrl,
+                                    sha256 = sha256,
+                                    releaseNotes = releaseNotes,
+                                    forceUpdate = forceUpdate,
+                                )
+                                return@withContext UpdateCheckResult.HasUpdate(info)
+                            } else {
+                                return@withContext UpdateCheckResult.UpToDate
+                            }
+                        }
+                    } else {
+                        lastErrorMsg = "HTTP ${response.code}"
+                    }
+                } catch (e: Exception) {
+                    lastErrorMsg = e.message ?: "网络连接异常"
+                }
             }
-
-            val body = response.body?.string()
-                ?: return@withContext UpdateCheckResult.Error("返回内容为空")
-
-            val json = JSONObject(body)
-            val remoteVersionCode = if (json.has("versionCode")) json.optInt("versionCode", 0) else 0
-            val remoteVersionName = if (json.has("versionName")) (json.optString("versionName", "") ?: "") else ""
-            val downloadUrl = if (json.has("downloadUrl")) (json.optString("downloadUrl", "") ?: "") else ""
-            val sha256 = (if (json.has("sha256")) (json.optString("sha256", "") ?: "") else "").trim().lowercase()
-            val releaseNotes = if (json.has("releaseNotes")) (json.optString("releaseNotes", "") ?: "") else ""
-            val forceUpdate = json.optBoolean("forceUpdate", false)
-
-            if (remoteVersionCode > currentVersionCode && downloadUrl.isNotBlank()) {
-                val info = OtaVersionInfo(
-                    versionCode = remoteVersionCode,
-                    versionName = remoteVersionName,
-                    downloadUrl = downloadUrl,
-                    sha256 = sha256,
-                    releaseNotes = releaseNotes,
-                    forceUpdate = forceUpdate,
-                )
-                UpdateCheckResult.HasUpdate(info)
-            } else {
-                UpdateCheckResult.UpToDate
-            }
+            UpdateCheckResult.Error(lastErrorMsg)
         }.getOrElse { e ->
             UpdateCheckResult.Error(e.message ?: "网络连接异常")
         }
@@ -76,42 +98,32 @@ class AppUpdateManager(
     ): Result<File> = withContext(Dispatchers.IO) {
         runCatching {
             _downloadState.value = DownloadProgressState.Downloading(0, 0, 0)
-            val request = Request.Builder().url(info.downloadUrl).build()
-            val response = httpClient.newCall(request).execute()
-            if (!response.isSuccessful) {
-                throw IllegalStateException("下载 APK 失败 (HTTP ${response.code})")
+
+            // 构建候选下载 URL 列表（支持 GitHub 原链及多个国内 CDN 镜像源自动故障转移）
+            val candidateUrls = mutableListOf<String>()
+            if (info.downloadUrl.contains("github.com")) {
+                candidateUrls.add("https://ghfast.top/${info.downloadUrl.replace("https://ghproxy.net/", "").replace("https://mirror.ghproxy.com/", "")}")
+                candidateUrls.add("https://gh-proxy.com/${info.downloadUrl.replace("https://ghproxy.net/", "").replace("https://mirror.ghproxy.com/", "")}")
             }
+            candidateUrls.add(info.downloadUrl)
 
-            val body = response.body ?: throw IllegalStateException("下载内容为空")
-            val totalBytes = body.contentLength()
-            val cacheDir = File(context.cacheDir, "updates").apply { mkdirs() }
-            val apkFile = File(cacheDir, "xiaozhi-update-${info.versionCode}.apk")
-            if (apkFile.exists()) apkFile.delete()
+            var lastError: Throwable? = null
+            var finalApkFile: File? = null
 
-            val input: InputStream = body.byteStream()
-            val output = FileOutputStream(apkFile)
-
-            input.use { inStream ->
-                output.use { outStream ->
-                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
-                    var bytesDownloaded = 0L
-                    var lastPercent = 0
-                    while (true) {
-                        val count = inStream.read(buffer)
-                        if (count < 0) break
-                        outStream.write(buffer, 0, count)
-                        bytesDownloaded += count
-
-                        if (totalBytes > 0) {
-                            val percent = ((bytesDownloaded * 100) / totalBytes).toInt()
-                            if (percent != lastPercent) {
-                                lastPercent = percent
-                                _downloadState.value = DownloadProgressState.Downloading(percent, bytesDownloaded, totalBytes)
-                            }
-                        }
+            for (url in candidateUrls) {
+                try {
+                    android.util.Log.d("AppUpdateManager", "Trying to download APK from: $url")
+                    finalApkFile = attemptDownload(url, info)
+                    if (finalApkFile != null) {
+                        break
                     }
+                } catch (e: Exception) {
+                    android.util.Log.w("AppUpdateManager", "Download failed from $url: ${e.message}")
+                    lastError = e
                 }
             }
+
+            val apkFile = finalApkFile ?: throw (lastError ?: IllegalStateException("所有下载源均失败"))
 
             _downloadState.value = DownloadProgressState.Verifying
             if (info.sha256.isNotBlank()) {
@@ -131,6 +143,49 @@ class AppUpdateManager(
         }
     }
 
+    private fun attemptDownload(url: String, info: OtaVersionInfo): File {
+        val request = Request.Builder()
+            .url(url)
+            .header("User-Agent", "Mozilla/5.0 (Linux; Android 11) XiaozhiClient/1.1.0")
+            .build()
+        val response = httpClient.newCall(request).execute()
+        if (!response.isSuccessful) {
+            throw IllegalStateException("HTTP ${response.code}")
+        }
+
+        val body = response.body ?: throw IllegalStateException("下载内容为空")
+        val totalBytes = body.contentLength()
+        val cacheDir = File(context.cacheDir, "updates").apply { mkdirs() }
+        val apkFile = File(cacheDir, "xiaozhi-update-${info.versionCode}.apk")
+        if (apkFile.exists()) apkFile.delete()
+
+        val input: InputStream = body.byteStream()
+        val output = FileOutputStream(apkFile)
+
+        input.use { inStream ->
+            output.use { outStream ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                var bytesDownloaded = 0L
+                var lastPercent = 0
+                while (true) {
+                    val count = inStream.read(buffer)
+                    if (count < 0) break
+                    outStream.write(buffer, 0, count)
+                    bytesDownloaded += count
+
+                    if (totalBytes > 0) {
+                        val percent = ((bytesDownloaded * 100) / totalBytes).toInt()
+                        if (percent != lastPercent) {
+                            lastPercent = percent
+                            _downloadState.value = DownloadProgressState.Downloading(percent, bytesDownloaded, totalBytes)
+                        }
+                    }
+                }
+            }
+        }
+        return apkFile
+    }
+
     fun installApk(apkFile: File): Boolean {
         if (!apkFile.exists()) return false
 
@@ -144,12 +199,27 @@ class AppUpdateManager(
     }
 
     private fun trySilentInstall(apkFile: File): Boolean {
-        return runCatching {
-            // 尝试执行 su -c pm install -r
-            val process = Runtime.getRuntime().exec(arrayOf("su", "-c", "pm install -r -d ${apkFile.absolutePath} && am start -n ${context.packageName}/.MainActivity"))
-            val exitCode = process.waitFor()
-            exitCode == 0
-        }.getOrDefault(false)
+        // RK3568 工控主板 su 语法支持: su 0 pm install -r -d <path>
+        val commands = listOf(
+            arrayOf("su", "0", "pm", "install", "-r", "-d", apkFile.absolutePath),
+            arrayOf("su", "-c", "pm install -r -d ${apkFile.absolutePath}"),
+            arrayOf("pm", "install", "-r", "-d", apkFile.absolutePath),
+        )
+        for (cmd in commands) {
+            val success = runCatching {
+                val process = Runtime.getRuntime().exec(cmd)
+                val exitCode = process.waitFor()
+                exitCode == 0
+            }.getOrDefault(false)
+
+            if (success) {
+                runCatching {
+                    Runtime.getRuntime().exec(arrayOf("am", "start", "-n", "${context.packageName}/.MainActivity"))
+                }
+                return true
+            }
+        }
+        return false
     }
 
     private fun tryPackageInstaller(apkFile: File): Boolean {
