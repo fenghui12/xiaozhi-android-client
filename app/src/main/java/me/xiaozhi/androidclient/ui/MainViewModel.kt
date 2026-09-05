@@ -185,6 +185,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             delay(AUTO_START_DELAY_MS)
             networkTimeSynchronizer.awaitValidSystemTime(::addLog)
             autoStartDeviceSession()
+            // 开机自动静默检测是否有新版本发布
+            delay(3000)
+            checkForAppUpdate(silent = true)
         }
     }
 
@@ -275,23 +278,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         reloadRoleProfiles()
     }
 
-    fun checkForAppUpdate() {
+    fun checkForAppUpdate(silent: Boolean = false) {
         if (_uiState.value.isCheckingUpdate || _uiState.value.isDownloadingUpdate) return
         viewModelScope.launch {
-            _uiState.update { it.copy(isCheckingUpdate = true, updateCheckStatus = "正在检查更新...") }
+            if (!silent) {
+                _uiState.update { it.copy(isCheckingUpdate = true, updateCheckStatus = "正在检查更新...") }
+            }
             val currentCode = _uiState.value.appVersionCode
             when (val result = appUpdateManager.checkForUpdate(currentCode)) {
                 is me.xiaozhi.androidclient.ota.UpdateCheckResult.UpToDate -> {
-                    _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "已是最新版本 (v${it.appVersionName})", availableUpdate = null) }
-                    addLog("检查更新：当前已是最新版本")
+                    if (!silent) {
+                        _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "已是最新版本 (v${it.appVersionName})", availableUpdate = null) }
+                        addLog("检查更新：当前已是最新版本")
+                    }
                 }
                 is me.xiaozhi.androidclient.ota.UpdateCheckResult.HasUpdate -> {
                     _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "发现新版本 v${result.info.versionName}", availableUpdate = result.info) }
                     addLog("发现新版本：v${result.info.versionName} (${result.info.releaseNotes.replace('\n', ' ')})")
                 }
                 is me.xiaozhi.androidclient.ota.UpdateCheckResult.Error -> {
-                    _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "检查更新失败: ${result.message}") }
-                    addLog("检查更新失败：${result.message}")
+                    if (!silent) {
+                        _uiState.update { it.copy(isCheckingUpdate = false, updateCheckStatus = "检查更新失败: ${result.message}") }
+                        addLog("检查更新失败：${result.message}")
+                    }
                 }
             }
         }
