@@ -2,8 +2,8 @@
   "versionCode": 4,
   "versionName": "1.2.0",
   "minSupportVersion": 1,
-  "downloadUrl": "https://ghproxy.net/https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.0-test/xiaozhi-v1.2.0.apk",
+  "downloadUrl": "http://192.168.5.163:8998/xiaozhi-v1.2.0.apk",
   "sha256": "145a2959926bb73e924dd8490b0cb873fb5359c20b92ee079449f30a30cf8df2",
   "forceUpdate": false,
-  "releaseNotes": "1. 远程OTA在线升级全链路加速与自检\n2. 内置国内CDN镜像加速与多节点自动故障转移\n3. 验证自动覆盖安装与生命周期恢复"
+  "releaseNotes": "1. 局域网极速OTA在线升级全链路实测\n2. 验证版本比对、断点流式下载与完整性哈希校验\n3. 验证自动覆盖安装与生命周期恢复"
 }
