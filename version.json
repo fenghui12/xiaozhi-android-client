@@ -1,9 +1,9 @@
 {
-  "versionCode": 6,
-  "versionName": "1.2.2",
+  "versionCode": 8,
+  "versionName": "1.2.4",
   "minSupportVersion": 1,
-  "downloadUrl": "https://ghfast.top/https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.2/xiaozhi-v1.2.2.apk",
-  "sha256": "5fd28802f5531b2c770fb1879039c681f58ddae2ec61a05e43840c8be2585e35",
+  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.4/xiaozhi-v1.2.4.apk",
+  "sha256": "9418cc02997d08096117452d91be16d5105e9fc49ef6c0455b6b1df3c08443aa",
   "forceUpdate": false,
-  "releaseNotes": "1. 修复删除角色时覆盖最新配置的问题\n2. 删除角色时同步清理头像和数字人视频资源\n3. 优化 OTA 检查并发控制、响应释放和失败下载清理"
+  "releaseNotes": "1. 修复重启后用户上传的形象素材被清空的严重问题\n2. 说话时可打断，且打断后立刻回到聆听中，无需重新喊唤醒词\n3. 删除用户端文字输入框，底部改为常驻的大号红色「打断」按钮\n4. 支持一次交代多个提醒，不再要求先取消已有任务\n5. 长句子不再被服务端通道拒收，失败时会明确提示\n6. 数字人界面可双向切换、开机启动画面、角色立绘、字号放大、摄像头方向修正"
 }
