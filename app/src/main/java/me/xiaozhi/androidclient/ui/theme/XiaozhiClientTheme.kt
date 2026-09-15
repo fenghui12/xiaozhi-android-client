@@ -15,24 +15,27 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-private val Iris = Color(0xFF6F4AB5)
-private val IrisSoft = Color(0xFFE9DFFF)
-private val Orchid = Color(0xFFA06CD5)
-private val Mint = Color(0xFF4E8B7E)
-private val Paper = Color(0xFFF7F2F8)
-private val LilacStone = Color(0xFFE7DFEA)
-private val Ink = Color(0xFF241A31)
-private val Night = Color(0xFF17111F)
+// 配色从原来的「鸢尾紫 + 兰花紫」换成一套冷静的品牌蓝。
+// 原方案在真机上偏灰紫、控件和背景互相抢，看着像未完成的默认主题。
+private val Brand = Color(0xFF3E7BFA)
+private val BrandSoft = Color(0xFFDCE8FF)
+private val BrandDeep = Color(0xFF1E4FB8)
+private val Teal = Color(0xFF3FA2B8)
+private val Mint = Color(0xFF3F8F7A)
+private val Paper = Color(0xFFF1F5FA)
+private val Stone = Color(0xFFE3EAF3)
+private val Ink = Color(0xFF16202E)
+private val Night = Color(0xFF10161F)
 
 private val LightColors = lightColorScheme(
-    primary = Iris,
+    primary = Brand,
     onPrimary = Color.White,
-    primaryContainer = IrisSoft,
-    onPrimaryContainer = Ink,
-    secondary = Orchid,
+    primaryContainer = BrandSoft,
+    onPrimaryContainer = BrandDeep,
+    secondary = Teal,
     onSecondary = Color.White,
-    secondaryContainer = Color(0xFFF0E4FF),
-    onSecondaryContainer = Ink,
+    secondaryContainer = Color(0xFFD8EEF4),
+    onSecondaryContainer = Color(0xFF10404C),
     tertiary = Mint,
     onTertiary = Color.White,
     tertiaryContainer = Color(0xFFD9F1EA),
@@ -41,8 +44,8 @@ private val LightColors = lightColorScheme(
     onBackground = Ink,
     surface = Color.White,
     onSurface = Ink,
-    surfaceVariant = LilacStone,
-    onSurfaceVariant = Color(0xFF5F566C),
+    surfaceVariant = Stone,
+    onSurfaceVariant = Color(0xFF566173),
     error = Color(0xFFBA1A1A),
     onError = Color.White,
     errorContainer = Color(0xFFFFDAD6),
@@ -84,7 +87,7 @@ private val AppShapes = Shapes(
 
 private val AppTypography = Typography(
     titleLarge = TextStyle(
-        fontFamily = FontFamily.Serif,
+        fontFamily = FontFamily.SansSerif,
         fontWeight = FontWeight.Bold,
         fontSize = 24.sp,
         lineHeight = 30.sp,

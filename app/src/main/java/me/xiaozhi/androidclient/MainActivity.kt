@@ -4,8 +4,11 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Bundle
 import java.io.File
-import android.widget.VideoView
+import android.os.Build
+import android.view.Gravity
 import android.view.ViewGroup
+import android.widget.FrameLayout
+import android.widget.VideoView
 import android.graphics.Bitmap
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -13,6 +16,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.BoxScope
@@ -44,13 +48,16 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -59,6 +66,7 @@ import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -70,6 +78,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -80,15 +89,22 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.dp
+import me.xiaozhi.androidclient.debug.DebugControlServer
+import org.json.JSONArray
+import org.json.JSONObject
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -124,17 +140,57 @@ private sealed interface PendingAudioAction {
     data class StartListening(val mode: ListeningMode) : PendingAudioAction
 }
 
-private val ChatBackground = Color(0xFFF7F4F9)
-private val SettingsBackground = Color(0xFFF4EFF7)
-private val UserBubble = Color(0xFF93E26A)
+// 配色：原方案是「淡紫底 + 亮绿气泡」，饱和度互相打架，看着像开发默认主题。
+// 换成一套冷调、低饱和、层级清楚的方案——底浅、卡片白、用户气泡用一个明确的品牌蓝。
+private val ChatBackground = Color(0xFFF1F5FA)
+private val SettingsBackground = Color(0xFFF1F5FA)
+private val UserBubble = Color(0xFF3E7BFA)
 private val AssistantBubble = Color.White
-private val HeaderTint = Color(0xFFF1E9FB)
+private val HeaderTint = Color(0xFFE8F0FC)
+private val BrandAccent = Color(0xFF3E7BFA)
+private val BrandAccentSoft = Color(0xFFDCE8FF)
+
+/**
+ * 「打断」按钮的红。比 Material 默认的 error 色更饱和、更亮，
+ * 因为它是数字人画面上唯一一个需要在「正在播报」的瞬间被一眼找到的控件。
+ */
+private val InterruptRed = Color(0xFFE53935)
+
+/**
+ * 全局文字放大系数。测试者第一条反馈就是“字体有点小”，
+ * 这台设备在桌面上是隔着一臂距离看的，默认字号偏小。
+ * 只放大 sp（文字），不改变 dp 布局尺寸，所以排版不会跟着散架。
+ */
+private const val UI_FONT_SCALE = 1.18f
+
+/** 启动进度界面最多挡这么久，避免没网时把用户锁在 Loading 上。 */
+private const val STARTUP_OVERLAY_TIMEOUT_MS = 25_000L
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // 让 App 能盖在锁屏之上显示，并在开机后点亮屏幕：
+        // 测试机上出现过“开机后黑屏、要上滑解锁才进得去”。
+        // 这两个 API 是 API 27 起才有的，而 minSdk 是 26，所以必须判断版本；
+        // manifest 里对应的两个属性在低版本上会被系统忽略，不会崩。
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
         enableEdgeToEdge()
-        setContent { XiaozhiClientTheme { XiaozhiApp() } }
+        setContent {
+            XiaozhiClientTheme {
+                val baseDensity = LocalDensity.current
+                CompositionLocalProvider(
+                    LocalDensity provides Density(
+                        density = baseDensity.density,
+                        fontScale = baseDensity.fontScale * UI_FONT_SCALE,
+                    ),
+                ) {
+                    XiaozhiApp()
+                }
+            }
+        }
     }
 }
 
@@ -158,6 +214,7 @@ private fun XiaozhiApp() {
     var pendingAudioAction by remember { mutableStateOf<PendingAudioAction?>(null) }
     var playbackCooldownActive by remember { mutableStateOf(false) }
     var avatarRoleId by remember { mutableStateOf<String?>(null) }
+    var portraitRoleId by remember { mutableStateOf<String?>(null) }
     var videoImportTarget by remember { mutableStateOf<Pair<String, DigitalHumanSlot>?>(null) }
 
     val wakeWordRecognizer = remember(context) {
@@ -191,6 +248,15 @@ private fun XiaozhiApp() {
             viewModel.importRoleAvatar(roleId, uri)
         }
         avatarRoleId = null
+    }
+    val portraitPickerLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent(),
+    ) { uri ->
+        val roleId = portraitRoleId
+        if (uri != null && roleId != null) {
+            viewModel.importRolePortrait(roleId, uri)
+        }
+        portraitRoleId = null
     }
     val videoPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent(),
@@ -272,6 +338,72 @@ private fun XiaozhiApp() {
         }
     }
 
+    // 开发期调试接口：只在 debug 构建里存在，绑定 127.0.0.1，
+    // 从开发机用 `adb forward tcp:8898 tcp:8898` 访问，不暴露到局域网。
+    if (BuildConfig.DEBUG) {
+        val debugServer = remember {
+            DebugControlServer(
+                stateJson = { stateToJson(latestState) },
+                logsJson = { since -> logsToJson(latestState, since) },
+                onSendText = { text ->
+                    val result = viewModel.submitExternalMessage(text)
+                    """{"ok":true,"result":${DebugControlServer.quote(result)}}"""
+                },
+                onAction = { name ->
+                    val result = when (name) {
+                        "listen" -> {
+                            requestMicrophoneForMode(ListeningMode.AUTO)
+                            "已请求开始聆听"
+                        }
+                        "stop" -> {
+                            viewModel.stopListening()
+                            "已停止录音"
+                        }
+                        "abort" -> {
+                            viewModel.abortSpeaking()
+                            "已请求打断播报"
+                        }
+                        "settings" -> {
+                            currentScreen = AppScreen.SETTINGS
+                            "已切到设置"
+                        }
+                        "chat" -> {
+                            currentScreen = AppScreen.CHAT
+                            "已切到聊天"
+                        }
+                        "clear_media" -> {
+                            viewModel.clearRoleMedia(latestState.activeRoleId)
+                            "已清空当前角色的数字人素材"
+                        }
+                        "import_demo_media" -> {
+                            val dir = File(context.getExternalFilesDir(null), "demo_media")
+                            viewModel.importDemoMediaFromDirectory(latestState.activeRoleId, dir)
+                        }
+                        "prepare_second_role" -> {
+                            val dir = File(context.getExternalFilesDir(null), "demo_media")
+                            viewModel.debugPrepareSecondRole(dir)
+                        }
+                        "cycle_role" -> viewModel.debugCycleRole()
+                        "import_demo_portrait" -> {
+                            val file = File(context.getExternalFilesDir(null), "demo_media/portrait.jpg")
+                            viewModel.importRolePortraitFromFile(latestState.activeRoleId, file)
+                        }
+                        "clear_portrait" -> {
+                            viewModel.clearRolePortrait(latestState.activeRoleId)
+                            "已清除当前角色立绘"
+                        }
+                        else -> "未知动作：$name"
+                    }
+                    """{"ok":true,"result":${DebugControlServer.quote(result)}}"""
+                },
+            )
+        }
+        DisposableEffect(Unit) {
+            debugServer.start()
+            onDispose { debugServer.stop() }
+        }
+    }
+
     XiaozhiScreen(
         state = latestState,
         currentScreen = currentScreen,
@@ -281,14 +413,16 @@ private fun XiaozhiApp() {
             avatarRoleId = roleId
             avatarPickerLauncher.launch("image/*")
         },
+        onPickRolePortrait = { roleId ->
+            portraitRoleId = roleId
+            portraitPickerLauncher.launch("image/*")
+        },
         onPickRoleVideo = { roleId, slot ->
             videoImportTarget = roleId to slot
             videoPickerLauncher.launch("video/*")
         },
         onStartListening = requestMicrophoneForMode,
         onStopListening = viewModel::stopListening,
-        onSendDraft = viewModel::sendDraftMessage,
-        onDraftChanged = viewModel::updateDraftMessage,
         onSelectRole = viewModel::selectRole,
         onAddRole = viewModel::addRole,
         onUpdateRole = viewModel::updateRole,
@@ -306,6 +440,8 @@ private fun XiaozhiApp() {
                 android.util.Log.e("LanVideoUpload", "Role not found for id: $roleId")
             }
         },
+        onAbortSpeaking = viewModel::abortSpeaking,
+        onClearRoleMedia = { roleId -> viewModel.clearRoleMedia(roleId) },
     )
     if (uploadSession != null) {
         UploadQrDialog(
@@ -320,6 +456,69 @@ private fun XiaozhiApp() {
     }
 }
 
+/** 当前应该播放哪一段数字人视频——判定逻辑与 DigitalHumanPanel 保持一致。 */
+private fun digitalHumanVideoName(state: UiState): String {
+    val path = when {
+        state.isAssistantSpeaking -> state.activeRoleSpeakingVideoPath
+        state.isRecording || state.isTurnActive -> state.activeRoleListeningVideoPath
+        else -> state.activeRoleIdleVideoPath
+    }
+    return path.substringAfterLast('/')
+}
+
+/** 调试接口 /state 的快照：只挑断言需要的字段，不做全量序列化。 */private fun stateToJson(state: UiState): String {
+    val messages = JSONArray()
+    state.chatMessages.forEach { message ->
+        messages.put(
+            JSONObject()
+                .put("role", message.role.name)
+                .put("text", message.text)
+                .put("at", message.timestamp),
+        )
+    }
+    val tasks = JSONArray()
+    state.scheduledTasks.forEach { task ->
+        tasks.put(
+            JSONObject()
+                .put("id", task.id)
+                .put("kind", task.kind)
+                .put("message", task.message)
+                .put("status", task.status)
+                .put("remainingSeconds", task.remainingSeconds ?: -1L),
+        )
+    }
+    return JSONObject()
+        .put("connectionStatus", state.connectionStatus.name)
+        .put("isRecording", state.isRecording)
+        .put("isAssistantSpeaking", state.isAssistantSpeaking)
+        .put("isTurnActive", state.isTurnActive)
+        .put("activeRoleId", state.activeRoleId)
+        .put("activeRoleName", state.activeRoleName)
+        .put("digitalHumanReady", state.activeRoleDigitalHumanReady)
+        .put("digitalHumanVideo", digitalHumanVideoName(state))
+        .put("wakeWordStatus", state.wakeWordStatus)
+        .put("lastSttText", state.lastSttText)
+        .put("lastTtsText", state.lastTtsText)
+        .put("versionName", state.appVersionName)
+        .put("versionCode", state.appVersionCode)
+        .put("chatMessages", messages)
+        .put("scheduledTasks", tasks)
+        .toString()
+}
+
+/** 调试接口 /log?since=N 的增量日志。 */
+private fun logsToJson(state: UiState, since: Int): String {
+    val array = JSONArray()
+    state.logs.drop(since.coerceAtLeast(0)).forEach { line ->
+        array.put(JSONObject().put("at", line.timestamp).put("message", line.message))
+    }
+    return JSONObject()
+        .put("total", state.logs.size)
+        .put("since", since)
+        .put("lines", array)
+        .toString()
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun XiaozhiScreen(
@@ -328,11 +527,10 @@ private fun XiaozhiScreen(
     onOpenSettings: () -> Unit,
     onBackToChat: () -> Unit,
     onPickRoleAvatar: (String) -> Unit,
+    onPickRolePortrait: (String) -> Unit,
     onPickRoleVideo: (String, DigitalHumanSlot) -> Unit,
     onStartListening: (ListeningMode) -> Unit,
     onStopListening: () -> Unit,
-    onSendDraft: () -> Unit,
-    onDraftChanged: (String) -> Unit,
     onSelectRole: (String) -> Unit,
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
@@ -340,7 +538,21 @@ private fun XiaozhiScreen(
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
     onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
+    onAbortSpeaking: () -> Unit,
+    onClearRoleMedia: (String) -> Unit,
 ) {
+    var everConnected by rememberSaveable { mutableStateOf(false) }
+    var startupGraceElapsed by rememberSaveable { mutableStateOf(false) }
+    LaunchedEffect(state.connectionStatus) {
+        if (state.connectionStatus == ConnectionStatus.CONNECTED) everConnected = true
+    }
+    LaunchedEffect(Unit) {
+        delay(STARTUP_OVERLAY_TIMEOUT_MS)
+        startupGraceElapsed = true
+    }
+    // 连上过一次、或者等了足够久（没网也不能永远挡着界面），就让位给正常界面。
+    val showStartupOverlay = !everConnected && !startupGraceElapsed
+
     Scaffold(
         containerColor = if (currentScreen == AppScreen.SETTINGS) SettingsBackground else ChatBackground,
         topBar = {
@@ -357,29 +569,76 @@ private fun XiaozhiScreen(
             }
         },
     ) { padding ->
-        when (currentScreen) {
-            AppScreen.CHAT -> ChatScreen(
-                state = state,
-                padding = padding,
-                onOpenSettings = onOpenSettings,
-                onStartListening = onStartListening,
-                onStopListening = onStopListening,
-                onSendDraft = onSendDraft,
-                onDraftChanged = onDraftChanged,
-            )
+        Box(modifier = Modifier.fillMaxSize()) {
+            when (currentScreen) {
+                AppScreen.CHAT -> ChatScreen(
+                    state = state,
+                    padding = padding,
+                    onOpenSettings = onOpenSettings,
+                    onStartListening = onStartListening,
+                    onStopListening = onStopListening,
+                    onAbortSpeaking = onAbortSpeaking,
+                    onClearRoleMedia = onClearRoleMedia,
+                )
 
-            AppScreen.SETTINGS -> SettingsScreen(
-                state = state,
-                padding = padding,
-                onSelectRole = onSelectRole,
-                onPickRoleAvatar = onPickRoleAvatar,
-                onPickRoleVideo = onPickRoleVideo,
-                onAddRole = onAddRole,
-                onUpdateRole = onUpdateRole,
-                onDeleteRole = onDeleteRole,
-                onCheckForUpdate = onCheckForUpdate,
-                onStartUpdate = onStartUpdate,
-                onStartVideoUpload = onStartVideoUpload,
+                AppScreen.SETTINGS -> SettingsScreen(
+                    state = state,
+                    padding = padding,
+                    onSelectRole = onSelectRole,
+                    onPickRoleAvatar = onPickRoleAvatar,
+                    onPickRolePortrait = onPickRolePortrait,
+                    onPickRoleVideo = onPickRoleVideo,
+                    onAddRole = onAddRole,
+                    onUpdateRole = onUpdateRole,
+                    onDeleteRole = onDeleteRole,
+                    onCheckForUpdate = onCheckForUpdate,
+                    onStartUpdate = onStartUpdate,
+                    onStartVideoUpload = onStartVideoUpload,
+                )
+            }
+
+            // 冷启动期间盖一层明确的进度界面：测试者把“开机后什么都没有”
+            // 直接理解成了死机，第一反应是拔电源。
+            if (showStartupOverlay) {
+                StartupLoadingOverlay(state = state)
+            }
+        }
+    }
+}
+
+/** 启动自检期间的全屏进度提示；连上过一次或超时后自动让位。 */
+@Composable
+private fun StartupLoadingOverlay(state: UiState) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(ChatBackground),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(18.dp),
+        ) {
+            CircularProgressIndicator(color = BrandAccent, strokeWidth = 4.dp)
+            Text(
+                text = "小智正在启动",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold,
+            )
+            Text(
+                text = when (state.connectionStatus) {
+                    ConnectionStatus.FETCHING_CONFIG -> "正在获取云端配置…"
+                    ConnectionStatus.CONNECTING -> "正在连接小智服务…"
+                    ConnectionStatus.FAILED -> "网络暂时不通，正在重试…"
+                    else -> "正在开机自检…"
+                },
+                style = MaterialTheme.typography.bodyLarge,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                text = "首次启动需要联网自检，通常几秒钟",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
     }
@@ -392,10 +651,13 @@ private fun ChatScreen(
     onOpenSettings: () -> Unit,
     onStartListening: (ListeningMode) -> Unit,
     onStopListening: () -> Unit,
-    onSendDraft: () -> Unit,
-    onDraftChanged: (String) -> Unit,
+    onAbortSpeaking: () -> Unit,
+    onClearRoleMedia: (String) -> Unit,
 ) {
     val listState = rememberLazyListState()
+    // 数字人就绪时是否盖住聊天区。用户可以随时切回聊天——
+    // 之前这里没有开关，上传视频后界面“回不去”，测试者最后靠删角色才恢复。
+    var showDigitalHuman by rememberSaveable { mutableStateOf(true) }
 
     LaunchedEffect(state.chatMessages.size) {
         if (state.chatMessages.isNotEmpty()) {
@@ -403,33 +665,87 @@ private fun ChatScreen(
         }
     }
 
-    Column(
-        modifier = Modifier
-            .fillMaxSize()
-            .background(ChatBackground)
-            .padding(padding)
-            .padding(horizontal = 14.dp, vertical = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-        ChatHeaderCard(
-            state = state,
-            onOpenSettings = onOpenSettings,
-        )
-
-        if (state.activationPending) {
-            ActivationBanner(
-                activationCode = state.activationCode,
-                activationMessage = state.activationMessage,
+    Box(modifier = Modifier.fillMaxSize()) {
+        // 角色形象有两条路：四段视频齐全就播动图，否则有立绘就放静态大图。
+        val hasCharacterVisual =
+            state.activeRoleDigitalHumanReady || state.activeRolePortraitPath.isNotBlank()
+        val digitalHumanVisible = hasCharacterVisual && showDigitalHuman
+        if (digitalHumanVisible) {
+            // 角色画面铺满整屏（含状态栏区域），控制条与输入框浮在画面之上。
+            // 之前它只占「被顶栏和输入框挤扁」的那块区域，还要按比例内缩，
+            // 角色显得明显偏小。
+            if (state.activeRoleDigitalHumanReady) {
+                DigitalHumanPanel(state = state, modifier = Modifier.fillMaxSize())
+            } else {
+                PortraitPanel(path = state.activeRolePortraitPath, modifier = Modifier.fillMaxSize())
+            }
+            if (state.isAssistantSpeaking) {
+                // 播报中：点画面任意处立刻打断，不用先找按钮。
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clickable { onAbortSpeaking() },
+                )
+            }
+        } else {
+            Image(
+                painter = painterResource(R.drawable.app_background),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
             )
         }
-
-        if (state.scheduledTasks.isNotEmpty()) {
-            CurrentTasksPanel(tasks = state.scheduledTasks)
-        }
-
-        if (state.activeRoleDigitalHumanReady) {
-            DigitalHumanPanel(state = state, modifier = Modifier.weight(1f))
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(padding)
+                .padding(horizontal = 14.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+        if (digitalHumanVisible) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Surface(
+                    color = Color.Black.copy(alpha = 0.42f),
+                    shape = RoundedCornerShape(20.dp),
+                ) {
+                    Text(
+                        text = digitalHumanStatusLabel(state),
+                        color = Color.White,
+                        style = MaterialTheme.typography.labelLarge,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                    )
+                }
+                DigitalHumanControlBar(
+                    onShowChat = { showDigitalHuman = false },
+                    onOpenSettings = onOpenSettings,
+                    onClearMedia = { onClearRoleMedia(state.activeRoleId) },
+                )
+            }
+            Spacer(modifier = Modifier.weight(1f))
+            if (state.scheduledTasks.isNotEmpty()) {
+                CurrentTasksPanel(tasks = state.scheduledTasks)
+            }
         } else {
+            ChatHeaderCard(
+                state = state,
+                onOpenSettings = onOpenSettings,
+            )
+
+            if (state.activationPending) {
+                ActivationBanner(
+                    activationCode = state.activationCode,
+                    activationMessage = state.activationMessage,
+                )
+            }
+
+            if (state.scheduledTasks.isNotEmpty()) {
+                CurrentTasksPanel(tasks = state.scheduledTasks)
+            }
+
             ChatMessageList(
                 messages = state.chatMessages,
                 assistantAvatarPath = state.activeRoleAvatarPath,
@@ -439,13 +755,117 @@ private fun ChatScreen(
             )
         }
 
+        if (state.activeRoleDigitalHumanReady || state.activeRolePortraitPath.isNotBlank()) {
+            if (!showDigitalHuman) {
+                DigitalHumanSwitchChip(
+                    label = if (state.activeRoleDigitalHumanReady) "切到数字人画面" else "查看角色立绘",
+                    onClick = { showDigitalHuman = true },
+                )
+            }
+        }
+
         ComposerCard(
             state = state,
-            onDraftChanged = onDraftChanged,
-            onSendDraft = onSendDraft,
             onStartListening = onStartListening,
             onStopListening = onStopListening,
+            onAbortSpeaking = onAbortSpeaking,
         )
+        }
+    }
+}
+
+/** 数字人画面左上角的状态胶囊文案。 */
+private fun digitalHumanStatusLabel(state: UiState): String = when {
+    state.isAssistantSpeaking -> "讲话中"
+    state.isRecording || state.isTurnActive -> "聆听中"
+    state.connectionStatus == ConnectionStatus.CONNECTED -> "待机中"
+    state.connectionStatus == ConnectionStatus.FETCHING_CONFIG -> "获取配置中"
+    state.connectionStatus == ConnectionStatus.CONNECTING -> "连接中"
+    state.connectionStatus == ConnectionStatus.FAILED -> "连接失败"
+    else -> "未连接"
+}
+
+/**
+ * 数字人画面右上角的辅助操作条：切回聊天 / 设置 / 清空素材。
+ *
+ * 「打断」**不在**这里——它已经挪到底部那颗大号红色按钮上（见 [ComposerCard]）。
+ * 原先它挤在这个小药丸里，测试者反馈「太偏了，在角落上不容易按到」。
+ */
+@Composable
+private fun DigitalHumanControlBar(
+    onShowChat: () -> Unit,
+    onOpenSettings: () -> Unit,
+    onClearMedia: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Surface(
+        modifier = modifier,
+        color = Color.Black.copy(alpha = 0.42f),
+        shape = RoundedCornerShape(24.dp),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
+            horizontalArrangement = Arrangement.spacedBy(2.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            TextButton(onClick = onShowChat) {
+                Text("聊天", color = Color.White)
+            }
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Default.Settings, contentDescription = "设置", tint = Color.White)
+            }
+            IconButton(onClick = onClearMedia) {
+                Icon(Icons.Default.Delete, contentDescription = "清空数字人素材", tint = Color.White)
+            }
+        }
+    }
+}
+
+/** 聊天视图下回到数字人画面 / 立绘的入口。 */
+@Composable
+private fun DigitalHumanSwitchChip(label: String, onClick: () -> Unit) {
+    Surface(
+        color = HeaderTint,
+        shape = RoundedCornerShape(18.dp),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+            horizontalArrangement = Arrangement.Center,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(label, style = MaterialTheme.typography.labelLarge)
+        }
+    }
+}
+
+/**
+ * 角色立绘：四段视频没配齐时用的一张静态大图。
+ * 测试者问过“不能一个角色一个配图吗”，这就是那个配图。
+ */
+@Composable
+private fun PortraitPanel(path: String, modifier: Modifier = Modifier) {
+    val bitmap = remember(path) {
+        runCatching { android.graphics.BitmapFactory.decodeFile(path) }.getOrNull()
+    }
+    Box(
+        modifier = modifier.background(Color(0xFF0B1016)),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (bitmap != null) {
+            Image(
+                bitmap = bitmap.asImageBitmap(),
+                contentDescription = null,
+                contentScale = ContentScale.Crop,
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else {
+            Text("立绘无法读取", color = Color.White)
+        }
     }
 }
 
@@ -457,32 +877,70 @@ private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
         else -> state.activeRoleIdleVideoPath
     }
     AndroidView(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier.clipToBounds(),
         factory = { context ->
-            VideoView(context).apply {
-                layoutParams = ViewGroup.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT,
-                    ViewGroup.LayoutParams.MATCH_PARENT,
+            FrameLayout(context).apply {
+                clipChildren = true
+                addView(
+                    VideoView(context).apply {
+                        setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                        setOnPreparedListener { player ->
+                            player.isLooping = true
+                            player.setVolume(0f, 0f)
+                            start()
+                            // cover：把画面放大到盖住整个容器，多出的部分由外层裁掉。
+                            // 原来 VideoView 默认按比例内缩，720x1256 的素材放进被顶栏和
+                            // 输入框挤扁的容器里会左右留大片黑边，数字人看着明显偏小。
+                            //
+                            // 尺寸必须在回调里当场读出来再交给 post——如果延迟到 post 里才读
+                            // player，切段时播放器可能已被释放，会抛 IllegalStateException
+                            // 直接把应用打崩（真机已复现过一次）。
+                            val videoWidth = player.videoWidth
+                            val videoHeight = player.videoHeight
+                            post { applyCoverLayout(videoWidth, videoHeight) }
+                        }
+                    },
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        Gravity.CENTER,
+                    ),
                 )
-                setBackgroundColor(android.graphics.Color.TRANSPARENT)
-                setOnPreparedListener { player ->
-                    player.isLooping = true
-                    player.setVolume(0f, 0f)
-                    start()
-                }
             }
         },
-        update = { view ->
+        update = { container ->
+            val video = container.getChildAt(0) as? VideoView ?: return@AndroidView
+            // 用「路径 + 最后修改时间」做标识：同一个槽位重传视频时路径字符串不变，
+            // 只比路径会导致画面不刷新，用户会以为重传没生效。
+            val stamp = if (path.isBlank()) "" else "$path@${File(path).lastModified()}"
             if (path.isBlank() || !File(path).exists()) {
-                view.stopPlayback()
-            } else if (view.tag != path) {
-                view.tag = path
-                view.setVideoPath(path)
-                view.start()
+                video.stopPlayback()
+            } else if (video.tag != stamp) {
+                video.tag = stamp
+                video.setVideoPath(path)
+                video.start()
             }
         },
-        onRelease = { it.stopPlayback() },
+        onRelease = { container -> (container.getChildAt(0) as? VideoView)?.stopPlayback() },
     )
+}
+
+/** 按 cover 方式把视频放大到铺满父容器；父容器负责裁掉超出的部分。 */
+private fun VideoView.applyCoverLayout(videoWidth: Int, videoHeight: Int) {
+    if (videoWidth <= 0 || videoHeight <= 0) return
+    if (!isAttachedToWindow) return
+    val containerWidth = width
+    val containerHeight = height
+    if (containerWidth <= 0 || containerHeight <= 0) return
+    val scale = maxOf(
+        containerWidth.toFloat() / videoWidth,
+        containerHeight.toFloat() / videoHeight,
+    )
+    layoutParams = (layoutParams as? FrameLayout.LayoutParams)?.apply {
+        width = (videoWidth * scale).toInt()
+        height = (videoHeight * scale).toInt()
+        gravity = Gravity.CENTER
+    } ?: layoutParams
 }
 
 @Composable
@@ -647,6 +1105,7 @@ private fun SettingsScreen(
     padding: PaddingValues,
     onSelectRole: (String) -> Unit,
     onPickRoleAvatar: (String) -> Unit,
+    onPickRolePortrait: (String) -> Unit,
     onPickRoleVideo: (String, DigitalHumanSlot) -> Unit,
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
@@ -670,6 +1129,7 @@ private fun SettingsScreen(
             state = state,
             onSelectRole = onSelectRole,
             onPickRoleAvatar = onPickRoleAvatar,
+            onPickRolePortrait = onPickRolePortrait,
             onPickRoleVideo = onPickRoleVideo,
             onStartVideoUpload = onStartVideoUpload,
             onAddRole = onAddRole,
@@ -858,6 +1318,7 @@ private fun RoleProfilesCard(
     state: UiState,
     onSelectRole: (String) -> Unit,
     onPickRoleAvatar: (String) -> Unit,
+    onPickRolePortrait: (String) -> Unit,
     onPickRoleVideo: (String, DigitalHumanSlot) -> Unit,
     onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
     onAddRole: (String, String) -> Unit,
@@ -894,6 +1355,7 @@ private fun RoleProfilesCard(
         RoleEditorDialog(
             role = editingRole,
             onPickAvatar = { editingRole?.id?.let(onPickRoleAvatar) },
+            onPickPortrait = { editingRole?.id?.let(onPickRolePortrait) },
             onPickVideo = { slot -> editingRole?.id?.let { onPickRoleVideo(it, slot) } },
             onStartVideoUpload = { slot ->
                 val targetRole = editingRole
@@ -970,6 +1432,7 @@ private fun RoleProfileRow(
 private fun RoleEditorDialog(
     role: RoleProfile?,
     onPickAvatar: () -> Unit,
+    onPickPortrait: () -> Unit,
     onPickVideo: (DigitalHumanSlot) -> Unit,
     onStartVideoUpload: (DigitalHumanSlot) -> Unit,
     onDismiss: () -> Unit,
@@ -995,6 +1458,25 @@ private fun RoleEditorDialog(
                         )
                         OutlinedButton(onClick = onPickAvatar) { Text("更换头像") }
                     }
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            text = if (role.portraitPath.isNotBlank() && File(role.portraitPath).exists()) {
+                                "角色立绘 · 已配置"
+                            } else {
+                                "角色立绘 · 未配置"
+                            },
+                        )
+                        OutlinedButton(onClick = onPickPortrait) { Text("选择立绘") }
+                    }
+                    Text(
+                        text = "四段形象视频没配齐时，用这张立绘当角色形象",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
                 OutlinedTextField(
                     value = name,
@@ -1048,11 +1530,11 @@ private fun RoleEditorDialog(
 @Composable
 private fun ComposerCard(
     state: UiState,
-    onDraftChanged: (String) -> Unit,
-    onSendDraft: () -> Unit,
     onStartListening: (ListeningMode) -> Unit,
     onStopListening: () -> Unit,
+    onAbortSpeaking: () -> Unit,
 ) {
+    val isSpeaking = state.isAssistantSpeaking
     Surface(
         color = Color.White,
         shape = RoundedCornerShape(30.dp),
@@ -1067,7 +1549,7 @@ private fun ComposerCard(
             if (state.isRecording || state.isAssistantSpeaking || state.lastSttText.isNotBlank()) {
                 val hint = when {
                     state.isRecording -> "正在聆听，说完会自动结束"
-                    state.isAssistantSpeaking -> "正在播报回复"
+                    state.isAssistantSpeaking -> "正在播报，点右边红色「打断」可以立刻让它闭嘴"
                     state.lastSttText.isNotBlank() -> state.lastSttText
                     else -> ""
                 }
@@ -1081,39 +1563,57 @@ private fun ComposerCard(
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
+                // 语音键：开始聆听 / 停止聆听。
+                // 播报中它不再兼任「打断」——那件事交给右边那颗大红键，
+                // 一颗键只做一件事，用户不用猜现在按下去会发生什么。
                 FilledTonalIconButton(
-                    enabled = state.isRecording || (!state.isAssistantSpeaking && !state.isTurnActive),
+                    enabled = state.isRecording || !state.isTurnActive,
                     onClick = {
-                        if (state.isRecording) onStopListening()
-                        else onStartListening(ListeningMode.AUTO)
+                        if (state.isRecording) onStopListening() else onStartListening(ListeningMode.AUTO)
                     },
+                    modifier = Modifier.size(52.dp),
                 ) {
                     Icon(
                         imageVector = if (state.isRecording) Icons.Default.Stop else Icons.Default.Mic,
-                        contentDescription = if (state.isRecording) "停止录音" else "语音输入",
+                        contentDescription = if (state.isRecording) "停止聆听" else "语音输入",
                     )
                 }
-                OutlinedTextField(
-                    value = state.draftMessage,
-                    onValueChange = onDraftChanged,
-                    modifier = Modifier.weight(1f),
-                    placeholder = { Text("输入消息") },
-                    singleLine = true,
-                    shape = RoundedCornerShape(24.dp),
-                    keyboardOptions = KeyboardOptions(imeAction = ImeAction.Send),
-                    keyboardActions = KeyboardActions(onSend = { onSendDraft() }),
-                )
-                FilledIconButton(
-                    onClick = onSendDraft,
-                    enabled = state.draftMessage.isNotBlank() &&
-                        !state.isRecording &&
-                        !state.isAssistantSpeaking &&
-                        !state.isTurnActive,
+
+                // 大号红色「打断」。
+                //
+                // 它以前是右上角小药丸里的一个 TextButton，测试者反馈「太偏了，在角落上
+                // 不容易按到」——播报中手忙脚乱去找一个 40dp 的小字按钮，体验确实很差。
+                // 现在改成常驻在底部、占满整行剩余宽度的大按钮：
+                //   * 位置固定，永远在同一个地方，不用找；
+                //   * 目标尺寸远大于 48dp 的最小可点区域，拇指随手就能按到；
+                //   * 不播报时保持可见但变暗（禁用态），这样用户平时就知道它在这儿，
+                //     播报时它一亮起来，肌肉记忆立刻接上。
+                Button(
+                    onClick = onAbortSpeaking,
+                    enabled = isSpeaking,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(52.dp),
+                    shape = RoundedCornerShape(26.dp),
+                    contentPadding = PaddingValues(horizontal = 16.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = InterruptRed,
+                        contentColor = Color.White,
+                        // 待机态用「浅粉底 + 实心红字」而不是「浅粉底 + 白字」：
+                        // 白字压在浅粉上几乎看不清，而测试者要的正是「平时也知道它在哪」。
+                        // 红字在浅粉底上对比度足够，既安静又始终可读。
+                        disabledContainerColor = InterruptRed.copy(alpha = 0.14f),
+                        disabledContentColor = InterruptRed,
+                    ),
                 ) {
-                    Icon(Icons.AutoMirrored.Filled.Send, contentDescription = "发送")
+                    Text(
+                        text = "打断",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                    )
                 }
             }
         }
@@ -1189,7 +1689,7 @@ private fun ChatBubble(
                 Column(horizontalAlignment = Alignment.End) {
                     Surface(
                         color = UserBubble,
-                        contentColor = Color(0xFF14210A),
+                        contentColor = Color.White,
                         shape = RoundedCornerShape(20.dp, 8.dp, 20.dp, 20.dp),
                     ) {
                         Text(

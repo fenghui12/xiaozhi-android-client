@@ -45,6 +45,7 @@ import me.xiaozhi.androidclient.model.UiState
 import me.xiaozhi.androidclient.model.resetConversationForRoleSwitch
 import me.xiaozhi.androidclient.network.NetworkTimeSynchronizer
 import me.xiaozhi.androidclient.network.OtaConfigService
+import me.xiaozhi.androidclient.audio.uploadDuringPlayback
 import me.xiaozhi.androidclient.network.XiaozhiRealtimeClient
 import me.xiaozhi.androidclient.scheduling.ReminderConversationState
 import me.xiaozhi.androidclient.scheduling.ReminderDeliveryAction
@@ -61,6 +62,13 @@ import org.json.JSONObject
 
 private const val APP_VERSION = "0.3.0"
 private const val LOG_TAG = "XiaozhiClient"
+
+/** 超过这个字数就不再直发 listen/detect，改走短暗号 + self.message.current 取回。 */
+private const val USER_TEXT_DIRECT_LIMIT = 12
+private const val USER_TEXT_CODE_PHRASE = "【文字消息】"
+
+/** 形如 “% self.timer.set…”“self.camera.take_photo…” 的模型工具调用回显。 */
+private val TOOL_CALL_ARTIFACT = Regex("^self\\.[a-zA-Z]+\\.[a-zA-Z]+\\s*[({]?")
 private const val UNBURNED_SERIAL_NUMBER = "未烧录"
 private const val WAKE_WORD_DISABLED = "未启用"
 private const val WAKE_WORD_STANDBY = "待命中"
@@ -123,6 +131,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var ignoreLifecycleGoodbyeAfterScheduledDelivery: Boolean = false
     private var appUpdateCheckJob: Job? = null
     private val pendingTextPrompts = ArrayDeque<String>()
+
+    /**
+     * 服务端对 listen/detect 通道有长度限制（实测 16 字通过、22 字被拒，
+     * 返回 `Detect is only for wake words, do not send long texts.`）。
+     * 用户在输入框里打的长句因此会静默失败——所以超过阈值的文字不发原文，
+     * 改发短暗号，由模型调用 self.message.current 取回原话。
+     */
+    private val pendingUserMessages = ArrayDeque<String>()
+
+    /** 诊断用：本轮播报是否已记录过"上行通道已打开"，避免刷屏。 */
+    private var playbackUplinkLogged = false
     private val pendingScheduledPrompts = ArrayDeque<ScheduledPrompt>()
     private var activeScheduledPrompt: ScheduledPrompt? = null
     private var roleProfiles: List<RoleProfile> = emptyList()
@@ -161,6 +180,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         isInitialSupervisionReminderInProgress = {
             activeScheduledPrompt?.text?.startsWith(SUPERVISION_START_CODE_PHRASE) == true
         },
+        pendingUserMessage = ::takePendingUserMessage,
         log = ::addLog,
     )
 
@@ -248,12 +268,111 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
+    /**
+     * 角色立绘：一张静态大图。四段视频没配齐时，用它当角色形象。
+     * 测试者问过“不能一个角色一个配图吗”，这就是那个配图。
+     */
+    fun importRolePortrait(roleId: String, uri: Uri) {
+        val role = roleProfiles.firstOrNull { it.id == roleId } ?: return
+        runCatching {
+            val dir = File(getApplication<Application>().filesDir, "portraits").apply { mkdirs() }
+            val target = File(dir, "role-${role.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}.jpg")
+            val resolver = getApplication<Application>().contentResolver
+            resolver.openInputStream(uri)?.use { input ->
+                target.outputStream().use { output -> input.copyTo(output) }
+            } ?: error("无法读取所选图片")
+            // 确认真的是一张能解码的图片，避免把坏文件写进配置
+            require(android.graphics.BitmapFactory.decodeFile(target.absolutePath) != null) {
+                "所选文件不是可识别的图片"
+            }
+            target.absolutePath
+        }.onSuccess { path ->
+            applyPortraitPath(role, path)
+            reloadRoleProfiles()
+            addLog("已更新${role.displayName}立绘")
+        }.onFailure { error ->
+            addLog("更新立绘失败：${error.message.orEmpty()}")
+        }
+    }
+
+    /** 供开发期调试接口使用：从本地文件导入立绘。 */
+    fun importRolePortraitFromFile(roleId: String, source: File): String {
+        val role = roleProfiles.firstOrNull { it.id == roleId } ?: return "角色不存在：$roleId"
+        return runCatching {
+            val dir = File(getApplication<Application>().filesDir, "portraits").apply { mkdirs() }
+            val target = File(dir, "role-${role.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}.jpg")
+            source.inputStream().use { input -> target.outputStream().use { output -> input.copyTo(output) } }
+            require(android.graphics.BitmapFactory.decodeFile(target.absolutePath) != null) {
+                "所选文件不是可识别的图片"
+            }
+            target.absolutePath
+        }.map { path ->
+            applyPortraitPath(role, path)
+            reloadRoleProfiles()
+            "已更新${role.displayName}立绘"
+        }.getOrElse { "导入立绘失败：${it.message}" }
+    }
+
+    fun clearRolePortrait(roleId: String) {
+        val role = roleProfiles.firstOrNull { it.id == roleId } ?: return
+        deleteFileIfOwned(role.portraitPath)
+        applyPortraitPath(role, "")
+        reloadRoleProfiles()
+        addLog("已清除${role.displayName}立绘")
+    }
+
+    private fun applyPortraitPath(role: RoleProfile, path: String) {
+        if (role.id == RoleProfileRepository.DEFAULT_ROLE_ID) {
+            updateAndPersist {
+                copy(
+                    assistantPortraitPath = path,
+                    activeRolePortraitPath = if (activeRoleId == role.id) path else activeRolePortraitPath,
+                )
+            }
+        } else {
+            saveAdditionalProfiles(
+                roleProfiles.filterNot(::isPrimaryRole).map { profile ->
+                    if (profile.id == role.id) profile.copy(portraitPath = path) else profile
+                },
+            )
+        }
+    }
+
     fun importRoleVideo(roleId: String, slot: DigitalHumanSlot, uri: Uri) {
         val role = roleProfiles.firstOrNull { it.id == roleId } ?: return
         digitalHumanAssets.importVideo(role, slot, uri).onSuccess { path ->
             updateRoleVideoPath(roleId, slot, path)
             addLog("已更新${role.displayName}${slot.label}")
         }.onFailure { error -> addLog("导入${slot.label}失败：${error.message.orEmpty()}") }
+    }
+
+    /**
+     * 供开发期调试接口使用：把指定目录下的 idle/greeting/listening/speaking 四段 mp4
+     * 走与扫码上传完全相同的导入路径（校验 + 拷贝 + 落库），用于自动化回归数字人。
+     */
+    fun importDemoMediaFromDirectory(roleId: String, directory: File): String {
+        val role = roleProfiles.firstOrNull { it.id == roleId } ?: return "角色不存在：$roleId"
+        var imported = 0
+        val failures = mutableListOf<String>()
+        DigitalHumanSlot.entries.forEach { slot ->
+            val source = File(directory, "${slot.wireName}.mp4")
+            if (!source.exists()) {
+                failures.add("${slot.wireName}(文件缺失)")
+                return@forEach
+            }
+            digitalHumanAssets.importVideoFile(role, slot, source)
+                .onSuccess { path ->
+                    updateRoleVideoPath(roleId, slot, path)
+                    imported++
+                }
+                .onFailure { error -> failures.add("${slot.wireName}(${error.message})") }
+        }
+        val summary = buildString {
+            append("导入 $imported/${DigitalHumanSlot.entries.size} 段")
+            if (failures.isNotEmpty()) append("，失败：").append(failures.joinToString("、"))
+        }
+        addLog("调试导入数字人素材：$summary")
+        return summary
     }
 
     fun updateRoleVideoPath(roleId: String, slot: DigitalHumanSlot, path: String) {
@@ -277,6 +396,50 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             })
         }
         reloadRoleProfiles()
+    }
+
+    /**
+     * 清空某个角色的数字人四段视频与头像。
+     * 测试者上传素材后在界面上找不到任何撤销入口，最后只能把整个角色删掉才恢复。
+     */
+    fun clearRoleMedia(roleId: String) {
+        val target = roleProfiles.firstOrNull { it.id == roleId }
+        digitalHumanAssets.deleteRoleAssets(roleId)
+        target?.let {
+            deleteFileIfOwned(it.avatarPath)
+            deleteFileIfOwned(it.portraitPath)
+        }
+        if (roleId == RoleProfileRepository.DEFAULT_ROLE_ID) {
+            updateAndPersist {
+                copy(
+                    idleVideoPath = "",
+                    greetingVideoPath = "",
+                    listeningVideoPath = "",
+                    speakingVideoPath = "",
+                    assistantAvatarPath = "",
+                    activeRoleAvatarPath = "",
+                    assistantPortraitPath = "",
+                    activeRolePortraitPath = "",
+                )
+            }
+        } else {
+            saveAdditionalProfiles(roleProfiles.filterNot(::isPrimaryRole).map { profile ->
+                if (profile.id != roleId) {
+                    profile
+                } else {
+                    profile.copy(
+                        avatarPath = "",
+                        portraitPath = "",
+                        idleVideoPath = "",
+                        greetingVideoPath = "",
+                        listeningVideoPath = "",
+                        speakingVideoPath = "",
+                    )
+                }
+            })
+        }
+        reloadRoleProfiles()
+        addLog("已清空${target?.displayName ?: "该角色"}的数字人素材与头像")
     }
 
     fun checkForAppUpdate(silent: Boolean = false) {
@@ -385,6 +548,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         saveAdditionalProfiles(roleProfiles.filterNot(::isPrimaryRole) + role)
         reloadRoleProfiles()
         selectRole(role.id)
+    }
+
+    /**
+     * 开发期调试用：确保存在第二个角色，并把 demo 素材导入当前活动角色。
+     * 用于回归测试者反馈的「两个角色各配了动图却无法自由切换」。
+     */
+    fun debugPrepareSecondRole(directory: File): String {
+        if (roleProfiles.none { !isPrimaryRole(it) }) {
+            addRole("小B", "你好小B")
+        }
+        val targetId = activeRoleId.ifBlank { RoleProfileRepository.DEFAULT_ROLE_ID }
+        val imported = importDemoMediaFromDirectory(targetId, directory)
+        return "角色=${activeRoleProfile().displayName}($targetId)，$imported"
+    }
+
+    /** 开发期调试用：在已有角色之间轮换。 */
+    fun debugCycleRole(): String {
+        val ids = roleProfiles.map { it.id }
+        if (ids.size < 2) return "当前只有 ${ids.size} 个角色，无法切换"
+        val nextIndex = (ids.indexOf(activeRoleId) + 1).mod(ids.size)
+        val next = ids[nextIndex]
+        val name = roleProfiles.firstOrNull { it.id == next }?.displayName ?: next
+        selectRole(next)
+        return "已切到 $name($next)"
     }
 
     fun updateRole(roleId: String, displayName: String, wakeWords: String) {
@@ -760,6 +947,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             greetingVideoPath = state.greetingVideoPath,
             listeningVideoPath = state.listeningVideoPath,
             speakingVideoPath = state.speakingVideoPath,
+            portraitPath = state.assistantPortraitPath,
             isBound = state.activated || state.websocketUrl.isNotBlank(),
             bindingCode = state.activationCode,
         )
@@ -777,6 +965,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     .joinToString(", "),
                 activeRoleName = activeRoleProfile().displayName,
                 activeRoleAvatarPath = activeRoleProfile().avatarPath,
+                activeRolePortraitPath = activeRoleProfile().portraitPath,
                 activeRoleDigitalHumanReady = activeRoleProfile().hasCompleteDigitalHuman(),
                 activeRoleIdleVideoPath = activeRoleProfile().idleVideoPath,
                 activeRoleGreetingVideoPath = activeRoleProfile().greetingVideoPath,
@@ -803,6 +992,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 clientId = uiState.value.clientId,
                 wakeWords = parseWakeWords(uiState.value.wakeWords),
                 avatarPath = uiState.value.assistantAvatarPath,
+                portraitPath = uiState.value.assistantPortraitPath,
                 idleVideoPath = uiState.value.idleVideoPath,
                 greetingVideoPath = uiState.value.greetingVideoPath,
                 listeningVideoPath = uiState.value.listeningVideoPath,
@@ -1088,8 +1278,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             mode = mode,
             onEncodedFrame = { frame ->
                 val state = uiState.value
-                if (state.isRecording && !state.isAssistantSpeaking) {
-                    realtimeClient.sendAudioFrame(frame)
+                // 这里**不能**再用 state.isRecording 当条件：本地静音检测自动停录时走的是
+                // finishListening(stopCapture = false, ...)，采集并没有停，但那个标志位会被
+                // 清成 false。用它做门禁会导致「采集在跑、帧却被丢掉」，语音打断永远不成立。
+                // 这个回调被调用本身就意味着采集正在进行，所以只需要判断播报状态：
+                //   uploadDuringPlayback —— 回声已被消掉，播报期间继续发，用户说话服务端才收得到；
+                //   否则 —— 播报期间必须停发，否则设备自己的声音会被当成人声，自己打断自己。
+                val shouldUpload = !state.isAssistantSpeaking || uploadDuringPlayback
+                if (shouldUpload) {
+                    val sent = realtimeClient.sendAudioFrame(frame)
+                    // 诊断用：确认播报期间上行通道真的在流动。语音打断失败时，
+                    // 这条日志能立刻区分「音频没发出去」和「服务端没响应」。
+                    if (state.isAssistantSpeaking && !playbackUplinkLogged) {
+                        playbackUplinkLogged = true
+                        addLog("播报期间已开始持续上行音频（语音打断通道已打开）")
+                    }
+                    sent
                 } else {
                     true
                 }
@@ -1143,19 +1347,52 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun abortSpeaking() {
-        conversationLoopActive = false
+        // 打断的语义是「别说了，听我说」——所以打断之后必须落回**聆听中**，
+        // 而不是甩回待机、逼用户重新喊一次唤醒词。（用户 2026-09-15 反馈：
+        // "你的打断是直接一下把它打到待机中了…但我想要的不是打到待机，而是切回聆听中"。）
+        //
+        // conversationLoopActive 是这里唯一的关键开关，它同时管两件事：
+        //   1. resumeConversationListeningAfterPlayback() 靠它决定播报结束后继续听还是 setNanoState("IDLE")；
+        //   2. startListening() 的门禁 (isTurnActive && !isRecording && !conversationLoopActive)
+        //      会因为它是 true 而放行——否则打断后立刻起听会被「请等小智说完再开始下一句」挡回来。
+        // 之前这里写的是 false，于是打断必然落到待机，正是用户遇到的现象。
+        conversationLoopActive = true
         scheduledResumeCancelledByUser = true
         ignoreLifecycleGoodbyeAfterScheduledDelivery = false
         clearPendingConversation()
-        finishListening(sendStop = false, stopCapture = true, keepTurnActive = false, reason = "已请求打断")
-        audioEngine.clearPlayback {
-            updateState { copy(isAssistantSpeaking = it) }
-        }
+        finishListening(
+            sendStop = false,
+            stopCapture = true,
+            keepTurnActive = false,
+            reason = "已请求打断，准备继续聆听",
+        )
+        audioEngine.clearPlayback { updateState { copy(isAssistantSpeaking = it) } }
         updateState { copy(isAssistantSpeaking = false) }
         if (realtimeClient.sendAbort()) {
             addLog("已向服务端发送打断请求")
         }
-        setNanoState("IDLE")
+        // 这里刻意**不再** setNanoState("IDLE")：落回聆听后由 startListening() 推进状态。
+        // resumeConversationListeningAfterPlayback() 内部有 300ms 延迟，
+        // 正好留出 stopCapture() 收尾和 [abort] 到达服务端的时间。
+        resumeConversationListeningAfterPlayback()
+    }
+
+    /**
+     * 供开发期调试接口使用：等价于用户在输入框里打下这段文字并按下发送。
+     * 刻意复用 updateDraftMessage + sendDraftMessage 这条完全相同的路径，
+     * 不绕过“设备正忙”等任何门控，否则自动测出来的结论不代表用户会遇到的路径。
+     * 返回一句人可读的结果，供断言。
+     */
+    fun submitExternalMessage(text: String): String {
+        val prompt = text.trim()
+        if (prompt.isBlank()) return "文本为空，未发送"
+        val state = uiState.value
+        if (state.isRecording || state.isAssistantSpeaking || state.isTurnActive) {
+            return "设备正忙，未发送"
+        }
+        updateDraftMessage(prompt)
+        sendDraftMessage()
+        return "已发送"
     }
 
     fun sendDraftMessage() {
@@ -1171,11 +1408,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         addChatMessage(ChatRole.USER, prompt)
         conversationLoopActive = true
         scheduledResumeCancelledByUser = false
-        pendingTextPrompts.addLast(prompt)
+        pendingTextPrompts.addLast(wireTextFor(prompt))
         updateState { copy(isTurnActive = true) }
         setNanoState("PROCESSING")
         addLog("准备发送文字消息")
         ensureReadyForConversation(trigger = "文字消息")
+    }
+
+    /**
+     * 决定这条用户文字用什么形式发给服务端：
+     * 短句直发原文；长句压成短暗号，正文留在本地等模型来取。
+     */
+    private fun wireTextFor(prompt: String): String {
+        if (prompt.length <= USER_TEXT_DIRECT_LIMIT) return prompt
+        synchronized(pendingUserMessages) { pendingUserMessages.addLast(prompt) }
+        addLog("文字超过 ${USER_TEXT_DIRECT_LIMIT} 字，改发短暗号并由模型取回原文（共 ${prompt.length} 字）")
+        return USER_TEXT_CODE_PHRASE
+    }
+
+    /** 供 MCP 工具 self.message.current 取回用户刚打的原话。 */
+    fun takePendingUserMessage(): String? = synchronized(pendingUserMessages) {
+        pendingUserMessages.pollFirst()
+    }
+
+    /** 判断一段模型输出是不是工具调用回显，而不是真正要对用户说的话。 */
+    private fun isToolCallArtifact(text: String): Boolean {
+        val normalized = text.trim().removePrefix("%").trim()
+        return TOOL_CALL_ARTIFACT.containsMatchIn(normalized)
     }
 
     fun sendMcp() {
@@ -1735,25 +1994,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         when (state) {
             "start" -> {
                 cancelScheduledDeliveryJob()
+                playbackUplinkLogged = false
                 audioEngine.beginPlaybackSession()
                 updateState { copy(isAssistantSpeaking = true, isTurnActive = true) }
                 setNanoState("SPEAKING")
-                finishListening(
-                    sendStop = false,
-                    stopCapture = true,
-                    keepTurnActive = true,
-                    reason = if (isBluetoothMicActive()) {
-                        "检测到蓝牙麦克风占用，播报前已释放录音以恢复媒体音质"
-                    } else {
-                        "服务端开始播报，已结束本地录音"
-                    },
-                )
+                // 语音打断（barge-in）的前提是「播报期间麦克风继续工作」——否则用户说话
+                // 服务端根本收不到，只能靠点屏幕打断。
+                // 回声由服务端消除：客户端在 hello 里声明 features.aec = true，服务端知道
+                // 自己发过什么 TTS，用它当参考把回声减掉。
+                // 蓝牙麦是例外：占着麦克风会明显劣化媒体音质，那种情况仍然释放。
+                if (isBluetoothMicActive()) {
+                    finishListening(
+                        sendStop = false,
+                        stopCapture = true,
+                        keepTurnActive = true,
+                        reason = "检测到蓝牙麦克风占用，播报前已释放录音以恢复媒体音质",
+                    )
+                } else {
+                    addLog("播报开始，保持录音以支持语音打断")
+                }
             }
 
             "sentence_start" -> {
                 if (text.isNotBlank()) {
                     updateState { copy(lastTtsText = text) }
-                    addChatMessage(ChatRole.ASSISTANT, text)
+                    // 模型偶尔把自己的工具调用当成一句话吐出来（形如 “% self.timer.set…”），
+                    // 这是协议噪声，不该出现在聊天气泡里。
+                    if (isToolCallArtifact(text)) {
+                        addLog("已过滤疑似工具调用回显：${text.take(60)}")
+                    } else {
+                        addChatMessage(ChatRole.ASSISTANT, text)
+                    }
                 }
             }
 
@@ -1824,11 +2095,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         val text = root.optString("text").orEmpty()
         if (text.isNotBlank() && text != uiState.value.lastSttText) {
+            // 语音打断：播报期间服务端还能识别出用户在说话，说明它已经把自己的回声消掉了
+            // （客户端在 hello 里声明了 features.aec）。这时本地必须**立刻**掐掉正在播的
+            // 音频——走正常的 tts stop 是等缓冲放完，用户会听到旧语音盖住新一轮。
+            if (uiState.value.isAssistantSpeaking) {
+                addLog("检测到语音打断，立即停止播报")
+                audioEngine.clearPlayback {
+                    updateState { copy(isAssistantSpeaking = it) }
+                }
+                updateState { copy(isAssistantSpeaking = false) }
+            }
             ignoreLifecycleGoodbyeAfterScheduledDelivery = false
             coordinateSupervisionFromUserSpeech(text)
             updateState { copy(lastSttText = text, isTurnActive = true) }
-            addChatMessage(ChatRole.USER, text)
+            // 本地短暗号（【定时提醒】【监督】【文字消息】…）会被服务端回显成 STT，
+            // 再当作用户发言加一遍的话，用户会看到自己刚打的整句话变成了「【文字消息】」。
+            if (isLocalCodePhrase(text)) {
+                addLog("已忽略本地短暗号的 STT 回显：$text")
+            } else {
+                addChatMessage(ChatRole.USER, text)
+            }
         }
+    }
+
+    /** 判断是不是设备自己发出去的短暗号。 */
+    private fun isLocalCodePhrase(text: String): Boolean {
+        val trimmed = text.trim()
+        return trimmed.length <= 12 && trimmed.startsWith("【") && trimmed.endsWith("】")
     }
 
     private fun coordinateSupervisionFromUserSpeech(text: String) {
@@ -1852,6 +2145,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         addLog("<= $rawText")
         val root = parseJson(rawText) ?: return
         if (!isCurrentSessionMessage(root)) return
+        // 服务端的拒绝事件以前只落到日志里，界面上一个字都没有——
+        // 用户正常打一句话发出去、被服务端拒了，看起来就是“石沉大海”。
+        val serverMessage = root.optString("message").orEmpty()
+        if (serverMessage.isNotBlank()) {
+            val friendly = when {
+                serverMessage.contains("Detect is only for wake words", ignoreCase = true) ->
+                    "这句话没能发出去：文字太长，服务端只接受短句。请说得短一点。"
+                else -> "服务端提示：$serverMessage"
+            }
+            addChatMessage(ChatRole.SYSTEM, friendly)
+        }
         val retryTimer = activeScheduledPrompt?.reminderKind == ReminderKind.TIMER
         finishScheduledDelivery("服务端拒绝事件", requeue = retryTimer)
         updateState { copy(isTurnActive = false) }
@@ -2036,6 +2340,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             clientId = storedConfig.clientId,
             serialNumber = UNBURNED_SERIAL_NUMBER,
             assistantAvatarPath = storedConfig.assistantAvatarPath,
+            assistantPortraitPath = storedConfig.assistantPortraitPath,
+            // 这四个数字人视频路径以前漏读了。后果很重：每次冷启动状态里都是空值，
+            // reloadRoleProfiles() 按空值重建主角色，紧接着的 persist() 又把空值写回磁盘，
+            // 于是用户上传的素材配置被永久抹掉——文件还在，App 却再也找不到。
+            // 测试者反馈的「两个角色各配了动图却无法切换」就是这个。
+            idleVideoPath = storedConfig.idleVideoPath,
+            greetingVideoPath = storedConfig.greetingVideoPath,
+            listeningVideoPath = storedConfig.listeningVideoPath,
+            speakingVideoPath = storedConfig.speakingVideoPath,
             websocketUrl = storedConfig.websocketUrl,
             authToken = storedConfig.authToken,
             protocolVersion = storedConfig.protocolVersion,
@@ -2066,6 +2379,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 deviceId = uiState.value.deviceId,
                 clientId = uiState.value.clientId,
                 assistantAvatarPath = uiState.value.assistantAvatarPath,
+                assistantPortraitPath = uiState.value.assistantPortraitPath,
                 idleVideoPath = uiState.value.idleVideoPath,
                 greetingVideoPath = uiState.value.greetingVideoPath,
                 listeningVideoPath = uiState.value.listeningVideoPath,

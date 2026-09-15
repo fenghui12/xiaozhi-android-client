@@ -11,6 +11,7 @@ private const val KEY_OTA_URL = "ota_url"
 private const val KEY_DEVICE_ID = "device_id"
 private const val KEY_CLIENT_ID = "client_id"
 private const val KEY_ASSISTANT_AVATAR_PATH = "assistant_avatar_path"
+private const val KEY_ASSISTANT_PORTRAIT_PATH = "assistant_portrait_path"
 private const val KEY_IDLE_VIDEO_PATH = "idle_video_path"
 private const val KEY_GREETING_VIDEO_PATH = "greeting_video_path"
 private const val KEY_LISTENING_VIDEO_PATH = "listening_video_path"
@@ -45,6 +46,7 @@ data class StoredConfig(
     val deviceId: String,
     val clientId: String,
     val assistantAvatarPath: String,
+    val assistantPortraitPath: String,
     val idleVideoPath: String,
     val greetingVideoPath: String,
     val listeningVideoPath: String,
@@ -84,6 +86,7 @@ class AppPreferences(private val context: Context) {
             deviceId = deviceId,
             clientId = clientId,
             assistantAvatarPath = prefs.getString(KEY_ASSISTANT_AVATAR_PATH, "") ?: "",
+            assistantPortraitPath = prefs.getString(KEY_ASSISTANT_PORTRAIT_PATH, "") ?: "",
             idleVideoPath = prefs.getString(KEY_IDLE_VIDEO_PATH, "") ?: "",
             greetingVideoPath = prefs.getString(KEY_GREETING_VIDEO_PATH, "") ?: "",
             listeningVideoPath = prefs.getString(KEY_LISTENING_VIDEO_PATH, "") ?: "",
@@ -117,6 +120,7 @@ class AppPreferences(private val context: Context) {
             .putString(KEY_DEVICE_ID, config.deviceId)
             .putString(KEY_CLIENT_ID, config.clientId)
             .putString(KEY_ASSISTANT_AVATAR_PATH, config.assistantAvatarPath)
+            .putString(KEY_ASSISTANT_PORTRAIT_PATH, config.assistantPortraitPath)
             .putString(KEY_IDLE_VIDEO_PATH, config.idleVideoPath)
             .putString(KEY_GREETING_VIDEO_PATH, config.greetingVideoPath)
             .putString(KEY_LISTENING_VIDEO_PATH, config.listeningVideoPath)

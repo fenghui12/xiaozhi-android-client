@@ -7,6 +7,8 @@ data class RoleProfile(
     val clientId: String,
     val wakeWords: List<String>,
     val avatarPath: String = "",
+    /** 角色立绘：一张静态大图。没有配齐四段视频时用它当角色形象。 */
+    val portraitPath: String = "",
     val isBound: Boolean = true,
     val bindingCode: String = "",
     val idleVideoPath: String = "",

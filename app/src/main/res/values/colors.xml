@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 冷启动时系统先画窗口背景、Compose 首帧要 4~5 秒才出来。
+         这段时间原本是一片没有任何信息的浅色空窗，测试者直接理解成死机。 -->
+    <color name="launch_background">#F1F5FA</color>
+</resources>

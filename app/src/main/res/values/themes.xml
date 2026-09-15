@@ -1,3 +1,8 @@
 <resources>
-    <style name="Theme.XiaozhiAndroidClient" parent="Theme.Material3.DayNight.NoActionBar" />
+    <style name="Theme.XiaozhiAndroidClient" parent="Theme.Material3.DayNight.NoActionBar">
+        <!-- 冷启动到 Compose 首帧之间约 4~5 秒，用一个明确的品牌启动底图填住，
+             避免用户把空窗当成死机。 -->
+        <item name="android:windowBackground">@drawable/launch_screen</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
 </resources>

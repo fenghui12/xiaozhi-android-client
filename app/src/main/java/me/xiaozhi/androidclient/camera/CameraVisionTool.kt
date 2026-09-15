@@ -4,7 +4,10 @@ import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.hardware.camera2.CameraCaptureSession
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraDevice
@@ -16,6 +19,8 @@ import android.media.ImageReader
 import android.os.Handler
 import android.os.HandlerThread
 import androidx.core.content.ContextCompat
+import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
@@ -28,6 +33,19 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 
 private const val CAMERA_CAPTURE_TIMEOUT_MS = 12_000L
+
+/**
+ * 摄像头模组在整机里是倒装的，拍出来的画面需要转 180° 才是正的；
+ * 之前写死为 0，导致云端模型看到的是倒像。
+ *
+ * 注意：不要用 `CaptureRequest.JPEG_ORIENTATION` 来做这件事——它只改 EXIF 标签、
+ * 不动像素数据。实测设成 180 之后，文件仍是 1280x720 的原始朝向 + Orientation=3，
+ * 云端视觉链路一旦不读 EXIF，模型看到的照样是倒的。
+ * 所以这里保持 EXIF 为正常朝向，自己把像素转正后再上传。
+ */
+private const val CAMERA_JPEG_ORIENTATION = 0
+private const val CAMERA_PIXEL_ROTATION_DEGREES = 180
+private const val CAMERA_JPEG_QUALITY = 92
 data class VisionEndpoint(
     val url: String,
     val token: String,
@@ -95,6 +113,36 @@ class CameraVisionTool(
         }
     }
 
+    /**
+     * 把拍摄到的 JPEG 像素真正旋转到位（而不是只写 EXIF 方向标签），
+     * 这样无论云端视觉链路读不读 EXIF，模型看到的都是正的。
+     */
+    private fun rotatePixels(bytes: ByteArray): ByteArray {
+        if (CAMERA_PIXEL_ROTATION_DEGREES == 0) return bytes
+        return runCatching {
+            val source = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return bytes
+            val matrix = Matrix().apply { postRotate(CAMERA_PIXEL_ROTATION_DEGREES.toFloat()) }
+            val rotated = Bitmap.createBitmap(source, 0, 0, source.width, source.height, matrix, true)
+            val output = ByteArrayOutputStream()
+            rotated.compress(Bitmap.CompressFormat.JPEG, CAMERA_JPEG_QUALITY, output)
+            if (rotated !== source) rotated.recycle()
+            source.recycle()
+            output.toByteArray()
+        }.getOrDefault(bytes)
+    }
+
+    /**
+     * 把最近一次拍摄的原始 JPEG 写到应用外部私有目录，供开发期核对画面方向。
+     * 只保留最近一帧，不累积。
+     */
+    private fun dumpCaptureForDebug(bytes: ByteArray) {
+        runCatching {
+            val dir = context.getExternalFilesDir("captures") ?: return
+            if (!dir.exists()) dir.mkdirs()
+            File(dir, "last_capture.jpg").writeBytes(bytes)
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private suspend fun captureJpeg(): ByteArray = suspendCancellableCoroutine { continuation ->
         val cameraManager = context.getSystemService(CameraManager::class.java)
@@ -133,7 +181,9 @@ class CameraVisionTool(
                         ?: throw IOException("Camera returned an empty JPEG frame")
                     val bytes = ByteArray(buffer.remaining())
                     buffer.get(bytes)
-                    complete(Result.success(bytes))
+                    val normalized = rotatePixels(bytes)
+                    dumpCaptureForDebug(normalized)
+                    complete(Result.success(normalized))
                 }
             } catch (error: Exception) {
                 complete(Result.failure(error))
@@ -173,7 +223,7 @@ class CameraVisionTool(
                                     val request = openedDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
                                         .apply {
                                             addTarget(reader.surface)
-                                            set(CaptureRequest.JPEG_ORIENTATION, 0)
+                                            set(CaptureRequest.JPEG_ORIENTATION, CAMERA_JPEG_ORIENTATION)
                                         }
                                         .build()
                                     captureSession.capture(

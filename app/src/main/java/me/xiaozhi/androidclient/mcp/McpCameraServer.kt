@@ -19,6 +19,8 @@ class McpCameraServer(
     private val isCurrentSession: (String) -> Boolean,
     private val isScheduledDeliveryInProgress: () -> Boolean,
     private val isInitialSupervisionReminderInProgress: () -> Boolean,
+    /** 用户在输入框里打的长文字（listen/detect 发不出去的那部分）。 */
+    private val pendingUserMessage: () -> String? = { null },
     private val log: (String) -> Unit,
 ) {
     fun handleIncomingMcp(rawText: String): Boolean {
@@ -88,15 +90,17 @@ class McpCameraServer(
                     .put(timerCurrentSchema())
                     .put(supervisionStartSchema())
                     .put(supervisionCurrentSchema())
-                    .put(supervisionCancelSchema()),
+                    .put(supervisionCancelSchema())
+                    .put(userMessageSchema()),
             ),
         )
-        log("已向服务端声明摄像头、定时提醒、监督开始和取消工具")
+        log("已向服务端声明摄像头、定时提醒、监督和用户文字工具")
     }
 
     private fun handleToolCall(id: Any, params: JSONObject?, requestSessionId: String?) {
         val name = params?.optString("name").orEmpty()
         val args = params?.optJSONObject("arguments") ?: JSONObject()
+        log("MCP 调用 $name ${summarizeToolArgs(args)}")
         when (name) {
             CAMERA_TOOL_NAME -> {
                 // Camera decisions belong to the model. Android only delivers
@@ -124,6 +128,14 @@ class McpCameraServer(
                 if (reminder == null) replyResult(id, toolTextResult("当前没有到期的定时提醒"))
                 else replyResult(id, toolTextResult("当前定时提醒：${reminder.message}"))
             }
+            "self.message.current" -> {
+                val text = pendingUserMessage()
+                if (text.isNullOrBlank()) {
+                    replyResult(id, toolTextResult("当前没有待读取的用户文字"))
+                } else {
+                    replyResult(id, toolTextResult("用户在设备屏幕上打给您的原话是：$text"))
+                }
+            }
             "self.supervision.start" -> {
                 if (isScheduledDeliveryInProgress()) {
                     log("任务投递期间拦截了 self.supervision.start")
@@ -135,7 +147,7 @@ class McpCameraServer(
                 val reminder = if (seconds in 1..86400 && message.isNotBlank()) {
                     reminderScheduler.startSupervision(seconds, message)
                 } else null
-                if (reminder == null) replyError(id, "已有监督任务，或参数无效")
+                if (reminder == null) replyError(id, "参数无效，或监督任务数量已达上限")
                 else replyResult(id, toolTextResult("监督任务已开始：${reminder.message}"))
             }
             "self.supervision.current" -> {
@@ -158,7 +170,7 @@ class McpCameraServer(
                     return
                 }
                 reminderScheduler.cancelSupervision()
-                replyResult(id, toolTextResult("监督任务已取消"))
+                replyResult(id, toolTextResult("当前到期的监督任务已取消"))
             }
             else -> replyError(id, "Unknown tool: $name")
         }
@@ -244,14 +256,21 @@ class McpCameraServer(
 
     private fun supervisionStartSchema() = simpleToolSchema(
         "self.supervision.start",
-        "Start one local supervision task. At the due time the device sends a reminder containing 【监督】; then you must call self.camera.take_photo before judging completion.",
+        "Start a camera-verified supervision task. Several supervision tasks may run at the same time: never tell the user to cancel an existing task first. For plain time reminders that do not need the camera, use self.timer.set instead.",
         JSONObject()
             .put("seconds", JSONObject().put("type", "integer"))
             .put("message", JSONObject().put("type", "string")),
         JSONArray().put("seconds").put("message"),
     )
 
-    private fun supervisionCancelSchema() = simpleToolSchema("self.supervision.cancel", "Cancel the active supervision task.", JSONObject(), JSONArray())
+    private fun supervisionCancelSchema() = simpleToolSchema("self.supervision.cancel", "Cancel the supervision task that is currently due. Other supervision tasks are kept.", JSONObject(), JSONArray())
+
+    private fun userMessageSchema() = simpleToolSchema(
+        "self.message.current",
+        "When you receive the exact marker 【文字消息】, call this tool to read the full sentence the user typed on the device screen, then answer it naturally. Never ask the user to repeat it and never guess its content.",
+        JSONObject(),
+        JSONArray(),
+    )
 
     private fun supervisionCurrentSchema() = simpleToolSchema(
         "self.supervision.current",
@@ -264,6 +283,13 @@ class McpCameraServer(
         .put("name", name)
         .put("description", description)
         .put("inputSchema", JSONObject().put("type", "object").put("properties", properties).put("required", required))
+
+    /** 工具入参的精简摘要，供日志断言使用；过长则截断，避免刷屏。 */
+    private fun summarizeToolArgs(args: JSONObject): String {
+        if (args.length() == 0) return "{}"
+        val text = args.toString()
+        return if (text.length <= 160) text else text.take(160) + "…"
+    }
 
     private fun toolTextResult(text: String): JSONObject = JSONObject()
         .put("content", JSONArray().put(JSONObject().put("type", "text").put("text", text)))

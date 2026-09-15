@@ -8,6 +8,7 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.withTimeout
+import me.xiaozhi.androidclient.audio.declareServerSideAec
 import me.xiaozhi.androidclient.model.ConnectParams
 import me.xiaozhi.androidclient.model.ListeningMode
 import me.xiaozhi.androidclient.model.ServerHello
@@ -265,7 +266,10 @@ class XiaozhiRealtimeClient(private val okHttpClient: OkHttpClient) {
             JSONObject()
                 .put("type", "hello")
                 .put("version", activeProtocolVersion)
-                .put("features", JSONObject().put("mcp", true))
+                // aec = true 表示请求服务端做回声消除。**实测官方云 api.tenclass.net 不支持**：
+                // 声明之后服务端照样把设备自己的播报识别成用户输入，导致复读死循环。
+                // 是否声明由 EchoCancelMode 决定，目前为 NONE（不声明）。
+                .put("features", JSONObject().put("mcp", true).put("aec", declareServerSideAec))
                 .put("transport", "websocket")
                 .put(
                     "audio_params",

@@ -14,6 +14,9 @@ import java.util.UUID
 
 enum class ReminderKind { TIMER, SUPERVISION }
 
+/** 同时允许存在的摄像头核验型监督任务数。用户会连续下达多条提醒，单任务限制会造成“需要先取消一个”。 */
+private const val MAX_CONCURRENT_SUPERVISIONS = 5
+
 enum class SupervisionPhase {
     COUNTDOWN,
     WAITING_FOR_ACK,
@@ -84,7 +87,9 @@ class ReminderScheduler(
 
     @Synchronized
     fun startSupervision(seconds: Int, message: String): ScheduledReminder? {
-        if (reminders.values.any { it.kind == ReminderKind.SUPERVISION }) return null
+        if (seconds <= 0 || seconds > 86_400) return null
+        val activeCount = reminders.values.count { it.kind == ReminderKind.SUPERVISION }
+        if (activeCount >= MAX_CONCURRENT_SUPERVISIONS) return null
         val reminder = ScheduledReminder(
             id = "supervision-${UUID.randomUUID()}",
             kind = ReminderKind.SUPERVISION,
@@ -127,8 +132,15 @@ class ReminderScheduler(
     @Synchronized
     fun cancelSupervision(): Boolean = removeSupervision()
 
+    /**
+     * 监督任务可以有多个同时存在（用户会连续下达“先提醒 A 再提醒 B”）。
+     * 优先返回“已到期、正在等待投递”的那一个——投递是按序串行的，
+     * 所以正在等投递的就是模型此刻问起的那一个。
+     */
     @Synchronized
-    fun activeSupervision(): ScheduledReminder? = reminders.values.firstOrNull { it.kind == ReminderKind.SUPERVISION }
+    fun activeSupervision(): ScheduledReminder? = reminders.values
+        .filter { it.kind == ReminderKind.SUPERVISION }
+        .let { list -> list.firstOrNull { it.deliveryPending } ?: list.firstOrNull() }
 
     @Synchronized
     fun activeTimer(): ScheduledReminder? = reminders.values
@@ -139,9 +151,13 @@ class ReminderScheduler(
     fun snapshot(): List<ScheduledReminder> = reminders.values.toList()
 
     private fun removeSupervision(reminderId: String? = null): Boolean {
-        val current = reminders.values.firstOrNull { it.kind == ReminderKind.SUPERVISION } ?: return false
-        if (reminderId != null && current.id != reminderId) return false
-        reminders.remove(current.id)
+        val supervisions = reminders.values.filter { it.kind == ReminderKind.SUPERVISION }
+        val target = if (reminderId != null) {
+            supervisions.firstOrNull { it.id == reminderId } ?: return false
+        } else {
+            supervisions.firstOrNull { it.deliveryPending } ?: supervisions.firstOrNull() ?: return false
+        }
+        reminders.remove(target.id)
         persist()
         onSnapshot(snapshot())
         return true

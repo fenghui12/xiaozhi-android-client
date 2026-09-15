@@ -44,6 +44,7 @@ class RoleProfileRepository(private val context: Context) {
                     .put("clientId", profile.clientId)
                     .put("wakeWords", JSONArray(profile.wakeWords))
                     .put("avatarPath", profile.avatarPath)
+                    .put("portraitPath", profile.portraitPath)
                     .put("isBound", profile.isBound)
                     .put("bindingCode", profile.bindingCode)
                     .put("idleVideoPath", profile.idleVideoPath)
@@ -91,6 +92,7 @@ class RoleProfileRepository(private val context: Context) {
             clientId = clientId,
             wakeWords = wakeWords,
             avatarPath = optString("avatarPath").trim(),
+            portraitPath = optString("portraitPath").trim(),
             isBound = if (has("isBound")) optBoolean("isBound") else true,
             bindingCode = optString("bindingCode").trim(),
             idleVideoPath = optString("idleVideoPath").trim(),

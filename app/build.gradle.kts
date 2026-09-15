@@ -20,8 +20,8 @@ android {
         applicationId = "me.xiaozhi.androidclient"
         minSdk = 26
         targetSdk = 34
-        versionCode = 6
-        versionName = "1.2.2"
+        versionCode = 8
+        versionName = "1.2.4"
     }
 
     signingConfigs {
@@ -57,6 +57,8 @@ android {
 
     buildFeatures {
         compose = true
+        // 生成 BuildConfig.DEBUG，用于把开发期调试接口限制在 debug 构建里。
+        buildConfig = true
     }
 
     composeOptions {

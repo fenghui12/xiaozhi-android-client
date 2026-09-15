@@ -459,10 +459,25 @@ class XiaozhiAudioEngine(context: Context) {
 
     private fun attachAudioEffects(audioRecord: AudioRecord) {
         releaseAudioEffects()
-        if (AcousticEchoCanceler.isAvailable()) {
+        if (!useDeviceAec) {
+            Log.d("XiaozhiClient", "[CAPTURE] AEC 未启用（EchoCancelMode=$ECHO_CANCEL_MODE）")
+            return
+        }
+        val available = AcousticEchoCanceler.isAvailable()
+        if (!available) {
+            Log.d("XiaozhiClient", "[CAPTURE] AEC 不可用：系统报告 AcousticEchoCanceler.isAvailable()=false")
+        } else {
             echoCanceler = AcousticEchoCanceler.create(audioRecord.audioSessionId)?.apply {
                 enabled = true
             }
+            // create() 返回非 null 不代表真的生效——跨声卡时它照样创建成功，
+            // 但拿不到回采参考，实际等于没开。必须看 enabled/hasControl 才能判断。
+            val ok = echoCanceler?.enabled == true && echoCanceler?.hasControl() == true
+            Log.d(
+                "XiaozhiClient",
+                "[CAPTURE] AEC created=${echoCanceler != null} enabled=${echoCanceler?.enabled} " +
+                    "hasControl=${echoCanceler?.hasControl()} → ${if (ok) "已生效" else "未生效（回声不会被消除）"}",
+            )
         }
         if (NoiseSuppressor.isAvailable()) {
             noiseSuppressor = NoiseSuppressor.create(audioRecord.audioSessionId)?.apply {
@@ -540,9 +555,17 @@ class XiaozhiAudioEngine(context: Context) {
             return null
         }
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
+        val builtin = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+        if (useDeviceAec) {
+            // 设备端 AEC 要求采集和播放落在**同一张声卡**上：安卓的 AcousticEchoCanceler
+            // 要音频 HAL 提供回采参考，跨卡时拿不到参考信号，effect 创建得出来但不生效。
+            // 板载麦与扬声器同在 card 1（rockchip_rk809-codec，pcmC1D0c + pcmC1D0p），
+            // 而 USB 摄像头麦是 card 2（只有采集、没有播放），钉在它上面必然跨卡。
+            builtin?.let { return it }
+        }
         return devices.firstOrNull(::isUsbInputDevice)
             ?: devices.firstOrNull(::isWiredInputDevice)
-            ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+            ?: builtin
             ?: devices.firstOrNull(::isBluetoothInputDevice)
             ?: devices.firstOrNull()
     }
