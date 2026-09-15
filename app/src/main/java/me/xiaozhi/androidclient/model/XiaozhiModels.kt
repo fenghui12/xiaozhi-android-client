@@ -1,5 +1,6 @@
 package me.xiaozhi.androidclient.model
 
+import me.xiaozhi.androidclient.BuildConfig
 import org.json.JSONObject
 
 data class OtaRequest(
@@ -145,8 +146,16 @@ data class UiState(
     val draftMessage: String = "",
     val chatMessages: List<ChatMessage> = emptyList(),
     val scheduledTasks: List<ScheduledTaskUi> = emptyList(),
-    val appVersionName: String = "1.2.2",
-    val appVersionCode: Int = 6,
+    // 版本号必须从构建信息读，**绝对不能硬编码**。
+    //
+    // 这里原先是写死的 "1.2.2" / 6，每次发版靠人工记得来改一行；结果 v1.2.3 就漏改了——
+    // build.gradle 已经是 7/1.2.3，这里还停在 6/1.2.2，于是：
+    //   1. 设置页永远显示"当前版本：v1.2.2 (Build 6)"，和实际装的包对不上；
+    //   2. OTA 用的是 appVersionCode 做比较（checkForUpdate(currentCode)），
+    //      装完新版后它仍然以为自己是 6，会**反复提示同一个更新**，升了等于没升。
+    // 改成读 BuildConfig 之后，版本号只有 build.gradle.kts 一个来源，这类漏改不可能再发生。
+    val appVersionName: String = BuildConfig.VERSION_NAME,
+    val appVersionCode: Int = BuildConfig.VERSION_CODE,
     val updateCheckStatus: String = "",
     val availableUpdate: me.xiaozhi.androidclient.ota.OtaVersionInfo? = null,
     val isCheckingUpdate: Boolean = false,

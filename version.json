@@ -3,7 +3,7 @@
   "versionName": "1.2.4",
   "minSupportVersion": 1,
   "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.4/xiaozhi-v1.2.4.apk",
-  "sha256": "9418cc02997d08096117452d91be16d5105e9fc49ef6c0455b6b1df3c08443aa",
+  "sha256": "923f333e27af7812ce94a3d129dea4b6b379620fd47081be6a9337a46d299972",
   "forceUpdate": false,
   "releaseNotes": "1. 修复重启后用户上传的形象素材被清空的严重问题\n2. 说话时可打断，且打断后立刻回到聆听中，无需重新喊唤醒词\n3. 删除用户端文字输入框，底部改为常驻的大号红色「打断」按钮\n4. 支持一次交代多个提醒，不再要求先取消已有任务\n5. 长句子不再被服务端通道拒收，失败时会明确提示\n6. 数字人界面可双向切换、开机启动画面、角色立绘、字号放大、摄像头方向修正"
 }
