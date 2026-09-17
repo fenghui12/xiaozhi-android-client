@@ -443,7 +443,19 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun checkForAppUpdate(silent: Boolean = false) {
-        if (appUpdateCheckJob?.isActive == true || _uiState.value.isDownloadingUpdate) return
+        if (_uiState.value.isDownloadingUpdate) return
+        if (appUpdateCheckJob?.isActive == true) {
+            // 关键：**手动点击优先**。
+            //
+            // 启动时会自动跑一次静默检查（silent = true），它不设置 isCheckingUpdate，
+            // 所以界面上看不出它在跑；而静默检查用的第一个候选源在部分网络下会挂住很久。
+            // 以前这里是无条件 return，于是用户在静默检查期间点「检查更新」——
+            // 按钮不变、状态栏空白，看起来就是"点了完全没反应"（用户 2026-09-16 反馈的
+            // "卡在那里"）。现在手动点击会把在跑的静默检查取消掉，立刻用自己的节奏重跑。
+            if (silent) return
+            addLog("手动检查更新：取消正在进行的后台检查，立即重新检查")
+            appUpdateCheckJob?.cancel()
+        }
         appUpdateCheckJob = viewModelScope.launch {
             if (!silent) {
                 _uiState.update { it.copy(isCheckingUpdate = true, updateCheckStatus = "正在检查更新...") }

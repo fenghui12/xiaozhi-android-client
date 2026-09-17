@@ -23,10 +23,28 @@ class AppUpdateManager(
     private val baseHttpClient: OkHttpClient,
     private val updateIndexUrl: String = DEFAULT_UPDATE_INDEX_URL,
 ) {
+    /** 下载 54MB 安装包用：超时给得宽，弱网下也不至于半途而废。 */
     private val httpClient = baseHttpClient.newBuilder()
         .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
         .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
+        .followRedirects(true)
+        .followSslRedirects(true)
+        .build()
+
+    /**
+     * 只用来拉 version.json 的客户端：**超时必须短**。
+     *
+     * version.json 只有几百字节，正常一两秒就该回来。之前它和下载共用上面那个
+     * 「读超时 300 秒」的客户端，于是第一个候选源在部分网络下挂住时，用户要盯着
+     * "正在检查更新" 干等整整五分钟——2026-09-16 用户反馈的"卡在那里"就是这个。
+     * 查询配置不需要那么宽的容忍度：一个源 8 秒没动静就换下一个，
+     * 三个源加起来最多也就二十几秒，而且正常情况下第一个（镜像）就成功了。
+     */
+    private val configHttpClient = baseHttpClient.newBuilder()
+        .connectTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(12, java.util.concurrent.TimeUnit.SECONDS)
+        .writeTimeout(8, java.util.concurrent.TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
         .build()
@@ -39,10 +57,14 @@ class AppUpdateManager(
 
     suspend fun checkForUpdate(currentVersionCode: Int): UpdateCheckResult = withContext(Dispatchers.IO) {
         runCatching {
+            // 顺序很重要：**镜像优先，GitHub 原链放最后**。
+            // raw.githubusercontent.com 在部分网络下不是快速失败而是直接挂住，
+            // 把它排在第一个，用户就要先白等一个超时才轮到能用的镜像。
+            // 两个镜像在国内都能直连，正常情况下第一个就返回了。
             val candidateIndexUrls = listOf(
-                updateIndexUrl,
                 "https://ghfast.top/$updateIndexUrl",
-                "https://gh-proxy.com/$updateIndexUrl"
+                "https://gh-proxy.com/$updateIndexUrl",
+                updateIndexUrl
             )
 
             var lastErrorMsg = "检测更新失败"
@@ -53,7 +75,7 @@ class AppUpdateManager(
                         .header("Cache-Control", "no-cache")
                         .build()
 
-                    httpClient.newCall(request).execute().use { response ->
+                    configHttpClient.newCall(request).execute().use { response ->
                     if (response.isSuccessful) {
                         val body = response.body?.string()
                         if (!body.isNullOrBlank()) {

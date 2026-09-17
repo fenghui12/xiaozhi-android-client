@@ -123,6 +123,7 @@ import me.xiaozhi.androidclient.model.RoleProfile
 import me.xiaozhi.androidclient.model.ScheduledTaskUi
 import me.xiaozhi.androidclient.model.UiState
 import me.xiaozhi.androidclient.model.DigitalHumanSlot
+import me.xiaozhi.androidclient.digitalhuman.CoverVideoView
 import me.xiaozhi.androidclient.digitalhuman.DigitalHumanAssetManager
 import me.xiaozhi.androidclient.digitalhuman.LanVideoUploadServer
 import me.xiaozhi.androidclient.digitalhuman.VideoUploadSession
@@ -882,22 +883,18 @@ private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
             FrameLayout(context).apply {
                 clipChildren = true
                 addView(
-                    VideoView(context).apply {
+                    CoverVideoView(context).apply {
                         setBackgroundColor(android.graphics.Color.TRANSPARENT)
                         setOnPreparedListener { player ->
                             player.isLooping = true
                             player.setVolume(0f, 0f)
                             start()
-                            // cover：把画面放大到盖住整个容器，多出的部分由外层裁掉。
-                            // 原来 VideoView 默认按比例内缩，720x1256 的素材放进被顶栏和
-                            // 输入框挤扁的容器里会左右留大片黑边，数字人看着明显偏小。
-                            //
-                            // 尺寸必须在回调里当场读出来再交给 post——如果延迟到 post 里才读
-                            // player，切段时播放器可能已被释放，会抛 IllegalStateException
-                            // 直接把应用打崩（真机已复现过一次）。
-                            val videoWidth = player.videoWidth
-                            val videoHeight = player.videoHeight
-                            post { applyCoverLayout(videoWidth, videoHeight) }
+                            // 只把尺寸告诉控件，缩放交给 CoverVideoView.onMeasure 去算。
+                            // 它每次父容器重新测量都会带着**当前**尺寸重算一遍，
+                            // 所以不存在"回调时机不对就把画面永久定死在错误尺寸"的问题
+                            // （旧写法在 onPrepared 里算一次绝对像素，客户机上出现过
+                            //  数字人缩到屏幕三分之一且再也回不来的情况）。
+                            setSourceSize(player.videoWidth, player.videoHeight)
                         }
                     },
                     FrameLayout.LayoutParams(
@@ -909,7 +906,7 @@ private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
             }
         },
         update = { container ->
-            val video = container.getChildAt(0) as? VideoView ?: return@AndroidView
+            val video = container.getChildAt(0) as? CoverVideoView ?: return@AndroidView
             // 用「路径 + 最后修改时间」做标识：同一个槽位重传视频时路径字符串不变，
             // 只比路径会导致画面不刷新，用户会以为重传没生效。
             val stamp = if (path.isBlank()) "" else "$path@${File(path).lastModified()}"
@@ -921,26 +918,8 @@ private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
                 video.start()
             }
         },
-        onRelease = { container -> (container.getChildAt(0) as? VideoView)?.stopPlayback() },
+        onRelease = { container -> (container.getChildAt(0) as? CoverVideoView)?.stopPlayback() },
     )
-}
-
-/** 按 cover 方式把视频放大到铺满父容器；父容器负责裁掉超出的部分。 */
-private fun VideoView.applyCoverLayout(videoWidth: Int, videoHeight: Int) {
-    if (videoWidth <= 0 || videoHeight <= 0) return
-    if (!isAttachedToWindow) return
-    val containerWidth = width
-    val containerHeight = height
-    if (containerWidth <= 0 || containerHeight <= 0) return
-    val scale = maxOf(
-        containerWidth.toFloat() / videoWidth,
-        containerHeight.toFloat() / videoHeight,
-    )
-    layoutParams = (layoutParams as? FrameLayout.LayoutParams)?.apply {
-        width = (videoWidth * scale).toInt()
-        height = (videoHeight * scale).toInt()
-        gravity = Gravity.CENTER
-    } ?: layoutParams
 }
 
 @Composable
