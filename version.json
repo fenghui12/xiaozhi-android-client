@@ -1,9 +1,9 @@
 {
-  "versionCode": 8,
-  "versionName": "1.2.4",
+  "versionCode": 9,
+  "versionName": "1.2.5",
   "minSupportVersion": 1,
-  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.4/xiaozhi-v1.2.4.apk",
-  "sha256": "923f333e27af7812ce94a3d129dea4b6b379620fd47081be6a9337a46d299972",
+  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.5/xiaozhi-v1.2.5.apk",
+  "sha256": "9b56d21ab6cdf4ceafdbe77361a25a237b44c8c219f782463ce2d3819ffb4177",
   "forceUpdate": false,
-  "releaseNotes": "1. 修复重启后用户上传的形象素材被清空的严重问题\n2. 说话时可打断，且打断后立刻回到聆听中，无需重新喊唤醒词\n3. 删除用户端文字输入框，底部改为常驻的大号红色「打断」按钮\n4. 支持一次交代多个提醒，不再要求先取消已有任务\n5. 长句子不再被服务端通道拒收，失败时会明确提示\n6. 数字人界面可双向切换、开机启动画面、角色立绘、字号放大、摄像头方向修正"
+  "releaseNotes": "1. 修复数字人画面会缩成一小块、且变小后再也回不来的问题\n2. 修复点「检查更新」长时间没反应：配置查询独立超时、镜像源优先、手动点击不再被后台检查挡掉（实测由 3 分钟缩短到 3 秒）"
 }
