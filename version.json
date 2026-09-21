@@ -1,9 +1,9 @@
 {
-  "versionCode": 9,
-  "versionName": "1.2.5",
+  "versionCode": 10,
+  "versionName": "1.2.6",
   "minSupportVersion": 1,
-  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.5/xiaozhi-v1.2.5.apk",
-  "sha256": "9b56d21ab6cdf4ceafdbe77361a25a237b44c8c219f782463ce2d3819ffb4177",
+  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.6/xiaozhi-v1.2.6.apk",
+  "sha256": "1ae061ae1a5facf3f99ce010d16b6776134f82779928e3eb000f2baae83539b4",
   "forceUpdate": false,
-  "releaseNotes": "1. 修复数字人画面会缩成一小块、且变小后再也回不来的问题\n2. 修复点「检查更新」长时间没反应：配置查询独立超时、镜像源优先、手动点击不再被后台检查挡掉（实测由 3 分钟缩短到 3 秒）"
+  "releaseNotes": "这一版主要是把几处会出事的隐患修掉：\n1. 升级更安全：装之前先核对这个包确实是我们自己发的，核对不过就不装\n2. 换素材不会再弄丢原来的：选到的文件有问题时，原来那张能用的不会被破坏\n3. 升级不容易卡住：网络不好时半分钟没动静就自动换线路，不再干等五分钟\n4. 角色设置不会莫名丢：读不到配置时保持原样，不再把已有角色清空\n5. 监督提醒会真的调摄像头确认，不再说完话就把任务删掉\n6. 导入手机拍的大照片不会再让设备卡死；存进去的图也压小了（14.85MB → 165KB）\n7. 定时任务多了不会再挡住底部的麦克风和打断按钮\n8. 删角色前会先弹确认框，并把这个角色的立绘等素材一起清干净\n9. 新建角色不再把你正在聊的角色顶掉\n10. 播报时的提示文字不再自相矛盾"
 }
