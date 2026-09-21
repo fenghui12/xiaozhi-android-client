@@ -48,13 +48,13 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material3.Button
@@ -64,7 +64,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledIconButton
-import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -438,8 +437,6 @@ private fun XiaozhiApp() {
             videoImportTarget = roleId to slot
             videoPickerLauncher.launch("video/*")
         },
-        onStartListening = requestMicrophoneForMode,
-        onStopListening = viewModel::stopListening,
         onSelectRole = viewModel::selectRole,
         onAddRole = viewModel::addRole,
         onUpdateRole = viewModel::updateRole,
@@ -546,8 +543,6 @@ private fun XiaozhiScreen(
     onPickRoleAvatar: (String) -> Unit,
     onPickRolePortrait: (String) -> Unit,
     onPickRoleVideo: (String, DigitalHumanSlot) -> Unit,
-    onStartListening: (ListeningMode) -> Unit,
-    onStopListening: () -> Unit,
     onSelectRole: (String) -> Unit,
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
@@ -592,8 +587,6 @@ private fun XiaozhiScreen(
                     state = state,
                     padding = padding,
                     onOpenSettings = onOpenSettings,
-                    onStartListening = onStartListening,
-                    onStopListening = onStopListening,
                     onAbortSpeaking = onAbortSpeaking,
                     onClearRoleMedia = onClearRoleMedia,
                 )
@@ -666,8 +659,6 @@ private fun ChatScreen(
     state: UiState,
     padding: PaddingValues,
     onOpenSettings: () -> Unit,
-    onStartListening: (ListeningMode) -> Unit,
-    onStopListening: () -> Unit,
     onAbortSpeaking: () -> Unit,
     onClearRoleMedia: (String) -> Unit,
 ) {
@@ -783,8 +774,6 @@ private fun ChatScreen(
 
         ComposerCard(
             state = state,
-            onStartListening = onStartListening,
-            onStopListening = onStopListening,
             onAbortSpeaking = onAbortSpeaking,
         )
         }
@@ -1605,8 +1594,6 @@ private fun RoleEditorDialog(
 @Composable
 private fun ComposerCard(
     state: UiState,
-    onStartListening: (ListeningMode) -> Unit,
-    onStopListening: () -> Unit,
     onAbortSpeaking: () -> Unit,
 ) {
     val isSpeaking = state.isAssistantSpeaking
@@ -1621,79 +1608,84 @@ private fun ComposerCard(
                 .padding(horizontal = 12.dp, vertical = 10.dp),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            if (state.isRecording || state.isAssistantSpeaking || state.lastSttText.isNotBlank()) {
-                val hint = when {
-                    // **播报要排在聆听前面。**
-                    // 播报期间麦克风是继续工作的（为了支持语音打断），所以 isRecording 也为 true。
-                    // 旧的顺序让 isRecording 先命中，于是同一屏上顶栏写「讲话中」、底部写「正在聆听」——
-                    // 2026-09-21 用户模拟测试把它当成一处自相矛盾的提示报了出来。
-                    // 此刻用户真正需要知道的是"它在说话、按右边那颗红键可以让它闭嘴"。
-                    state.isAssistantSpeaking -> "正在播报，点右边红色「打断」可以立刻让它闭嘴"
-                    state.isRecording -> "正在聆听，说完会自动结束"
-                    state.lastSttText.isNotBlank() -> state.lastSttText
-                    else -> ""
-                }
-                Text(
-                    text = hint,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 8.dp),
-                )
-            }
-
+            // 整条底栏只有一行：麦克风 · 字幕 · 打断圆键。
+            //
+            // 原先这里还有一条单独占一行的状态提示，而中间那颗「打断」横贯整行。
+            // 用户反馈那颗按钮"太大、太占空间，其实没有意义"——它占着整行宽度却不承载
+            // 任何信息。现在把它缩成最右边的圆键，让出来的宽度给字幕，
+            // 状态提示也一并合进字幕区，于是**整体少了一行**。
             Row(
                 modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                // 语音键：开始聆听 / 停止聆听。
-                // 播报中它不再兼任「打断」——那件事交给右边那颗大红键，
-                // 一颗键只做一件事，用户不用猜现在按下去会发生什么。
-                FilledTonalIconButton(
-                    enabled = state.isRecording || !state.isTurnActive,
-                    onClick = {
-                        if (state.isRecording) onStopListening() else onStartListening(ListeningMode.AUTO)
-                    },
-                    modifier = Modifier.size(52.dp),
+                // 字幕区：显示「此刻在说什么」。
+                //   * 播报中 → 小智正在说的那一句；
+                //   * 聆听中 → 刚识别到的用户原话（还没识别出来就提示"正在聆听"）；
+                //   * 待机   → 小智最后说过的一句；一句都没有时提示怎么叫它。
+                // 客户之前问过"为什么有动画的角色反而不显示文字"——这条就是那个文字。
+                val subtitle = when {
+                    // **播报要排在聆听前面。**
+                    // 播报期间麦克风是继续工作的（为了支持语音打断），所以 isRecording 也为 true。
+                    // 顺序反了就会出现同一屏上顶栏写「讲话中」、底部写「正在聆听」的自相矛盾
+                    // （2026-09-21 用户模拟测试把它当成一处矛盾提示报了出来）。
+                    state.isAssistantSpeaking -> state.lastTtsText.ifBlank { "正在播报…" }
+                    state.isRecording -> state.lastSttText.ifBlank { "正在聆听…" }
+                    state.lastTtsText.isNotBlank() -> state.lastTtsText
+                    // 待机且还没说过话：**必须告诉用户怎么开始**。
+                    // 底栏原来的麦克风键已经去掉了（这台设备是语音优先的，客户也明确要求
+                    // 屏幕上不要有需要手动点的入口），于是唤醒词成了唯一的启动方式——
+                    // 那就把它写出来，否则新用户面对一块安静的黑屏无从下手。
+                    else -> state.roleProfiles
+                        .firstOrNull { it.id == state.activeRoleId }
+                        ?.wakeWords
+                        ?.firstOrNull()
+                        ?.let { "说「$it」叫我" }
+                        .orEmpty()
+                }
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 52.dp),
+                    contentAlignment = Alignment.CenterStart,
                 ) {
-                    Icon(
-                        imageVector = if (state.isRecording) Icons.Default.Stop else Icons.Default.Mic,
-                        contentDescription = if (state.isRecording) "停止聆听" else "语音输入",
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = if (state.isAssistantSpeaking) {
+                            MaterialTheme.colorScheme.onSurface
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
                     )
                 }
 
-                // 大号红色「打断」。
+                // 打断：一颗红圆键，只在播报中才亮起来。
                 //
-                // 它以前是右上角小药丸里的一个 TextButton，测试者反馈「太偏了，在角落上
-                // 不容易按到」——播报中手忙脚乱去找一个 40dp 的小字按钮，体验确实很差。
-                // 现在改成常驻在底部、占满整行剩余宽度的大按钮：
-                //   * 位置固定，永远在同一个地方，不用找；
-                //   * 目标尺寸远大于 48dp 的最小可点区域，拇指随手就能按到；
-                //   * 不播报时保持可见但变暗（禁用态），这样用户平时就知道它在这儿，
-                //     播报时它一亮起来，肌肉记忆立刻接上。
-                Button(
+                // 它的位置与尺寸是两次反馈的折中：最初是右上角小药丸里的 TextButton，
+                // 测试者说「太偏了不容易按到」，于是做成横贯整行的大按钮；
+                // 之后又反馈「这么大其实没有意义、太占空间」。
+                // 现在缩成 52dp 的圆键 —— 位置仍在最右、目标仍远大于 48dp 的最小可点区域，
+                // 拇指一样够得到，而让出来的宽度给了字幕。
+                //
+                // 图标用 ×（Close）而不是停止方块：播报期间旁边已经没有任何方块图标了，
+                // 但 × 在红色圆底上表达「别说了」更直白，也不会被误认成"停止录音"。
+                FilledIconButton(
                     onClick = onAbortSpeaking,
                     enabled = isSpeaking,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(52.dp),
-                    shape = RoundedCornerShape(26.dp),
-                    contentPadding = PaddingValues(horizontal = 16.dp),
-                    colors = ButtonDefaults.buttonColors(
+                    modifier = Modifier.size(52.dp),
+                    colors = IconButtonDefaults.filledIconButtonColors(
                         containerColor = InterruptRed,
                         contentColor = Color.White,
-                        // 待机态用「浅粉底 + 实心红字」而不是「浅粉底 + 白字」：
-                        // 白字压在浅粉上几乎看不清，而测试者要的正是「平时也知道它在哪」。
-                        // 红字在浅粉底上对比度足够，既安静又始终可读。
+                        // 待机态保留一颗淡红底的键：用户平时就知道它在这儿，
+                        // 播报时它一亮起来，肌肉记忆立刻接上。
                         disabledContainerColor = InterruptRed.copy(alpha = 0.14f),
                         disabledContentColor = InterruptRed,
                     ),
                 ) {
-                    Text(
-                        text = "打断",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                    )
+                    Icon(Icons.Default.Close, contentDescription = "打断")
                 }
             }
         }

@@ -538,7 +538,10 @@ class XiaozhiAudioEngine(context: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             return
         }
-        findPreferredInputDevice()?.let { device ->
+        // 走共享选择器：没有 USB/有线麦时它**会等一小会儿**（USB 设备常在 App 启动后
+        // 才被系统枚举出来，见 InputDeviceSelector 的类注释）。这里跑在 Dispatchers.IO
+        // 上的采集协程里，阻塞等待不影响界面。
+        InputDeviceSelector.select(audioManager, preferBuiltin = useDeviceAec)?.let { device ->
             runCatching { audioRecord.preferredDevice = device }
             Log.d("XiaozhiClient", "[CAPTURE] preferred input device=${device.productName} type=${device.type}")
         }
@@ -550,25 +553,9 @@ class XiaozhiAudioEngine(context: Context) {
         )
     }
 
-    private fun findPreferredInputDevice(): AudioDeviceInfo? {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            return null
-        }
-        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-        val builtin = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
-        if (useDeviceAec) {
-            // 设备端 AEC 要求采集和播放落在**同一张声卡**上：安卓的 AcousticEchoCanceler
-            // 要音频 HAL 提供回采参考，跨卡时拿不到参考信号，effect 创建得出来但不生效。
-            // 板载麦与扬声器同在 card 1（rockchip_rk809-codec，pcmC1D0c + pcmC1D0p），
-            // 而 USB 摄像头麦是 card 2（只有采集、没有播放），钉在它上面必然跨卡。
-            builtin?.let { return it }
-        }
-        return devices.firstOrNull(::isUsbInputDevice)
-            ?: devices.firstOrNull(::isWiredInputDevice)
-            ?: builtin
-            ?: devices.firstOrNull(::isBluetoothInputDevice)
-            ?: devices.firstOrNull()
-    }
+    /** 只是"看一眼当前路由"，**不能等**（waitMs = 0）——否则刷新一下状态文案就卡两秒。 */
+    private fun findPreferredInputDevice(): AudioDeviceInfo? =
+        InputDeviceSelector.select(audioManager, preferBuiltin = useDeviceAec, waitMs = 0)
 
     private fun findPreferredOutputDevice(): AudioDeviceInfo? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {

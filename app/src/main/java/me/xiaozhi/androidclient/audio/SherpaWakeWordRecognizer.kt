@@ -28,6 +28,9 @@ private const val KWS_MODEL_DIR =
 private const val KWS_PLACEHOLDER_KEYWORDS_FILE = "$KWS_MODEL_DIR/runtime-placeholder-keywords.txt"
 private const val KWS_INTERVAL_MS = 100
 private const val KWS_DETECTION_COOLDOWN_MS = 2_500L
+
+/** 监听期间复查输入设备的间隔。见 [recheckInputDevice]。 */
+private const val KWS_DEVICE_RECHECK_MS = 5_000L
 private const val KWS_RELEASE_BEFORE_CAPTURE_MS = 350L
 private const val KWS_REARM_RETRY_MS = 100L
 private const val KWS_KEYWORDS_SCORE = 3.0f
@@ -58,6 +61,12 @@ class SherpaWakeWordRecognizer(
 
     @Volatile
     private var listeningRequested: Boolean = false
+
+    /** 当前实际绑定的输入设备。用于判断"我是不是还绑在那个没焊咪头的板载麦上"。 */
+    private var boundInputDevice: AudioDeviceInfo? = null
+
+    /** 上一次复查输入设备的时刻。 */
+    private var lastDeviceCheckAtMs: Long = 0L
 
     fun start(wakeWords: String) {
         if (released) {
@@ -209,6 +218,14 @@ class SherpaWakeWordRecognizer(
                 continue
             }
 
+            // 监听期间定期复查输入设备：USB 麦克风可能在 App 启动之后才被系统枚举出来，
+            // 而选择器只在"开录那一刻"看得到它。绑错了就在这里自愈。
+            val nowMs = SystemClock.elapsedRealtime()
+            if (nowMs - lastDeviceCheckAtMs >= KWS_DEVICE_RECHECK_MS) {
+                lastDeviceCheckAtMs = nowMs
+                recheckInputDevice(record)
+            }
+
             val samples = FloatArray(read) { index -> buffer[index] / 32768.0f }
             stream.acceptWaveform(samples, sampleRate = KWS_SAMPLE_RATE)
 
@@ -217,17 +234,38 @@ class SherpaWakeWordRecognizer(
                 val keyword = kws.getResult(stream).keyword
                 if (keyword.isNotBlank()) {
                     kws.reset(stream)
-                    handleDetectedKeyword(keyword)
-                    return
+                    // **只有真的被受理了才退出监听循环。**
+                    //
+                    // 冷却期（KWS_DETECTION_COOLDOWN_MS）内命中的那一次会被
+                    // handleDetectedKeyword 直接丢弃。旧写法在这里无条件 `return`，
+                    // 于是录音线程退出了、而 shouldListen 仍是 true、界面还挂着
+                    // 「正在监听唤醒词」—— 设备从此**再也唤不醒**，只能重启。
+                    //
+                    // 触发场景很普通：喊一遍没反应、紧接着再喊一遍（间隔 < 2.5 秒）。
+                    // 底栏的手动麦克风键移除之后，唤醒词是唯一的启动方式，
+                    // 这条就从"可能发生"变成"一旦发生就没救"。（评审 #19）
+                    if (handleDetectedKeyword(keyword)) {
+                        return
+                    }
                 }
             }
         }
     }
 
-    private fun handleDetectedKeyword(keyword: String) {
+    /**
+     * 处理一次唤醒词命中。
+     *
+     * @return **true 表示这次命中被真正受理**（已停掉录音、交给上层去开对话），
+     *   调用方应当退出监听循环；**false 表示被冷却期抑制、什么都没做**，
+     *   调用方必须**继续监听**，不能退出循环——否则线程结束了而状态还写着
+     *   「正在监听」，设备就再也唤不醒了。
+     */
+    private fun handleDetectedKeyword(keyword: String): Boolean {
         val now = SystemClock.elapsedRealtime()
         if (now - lastDetectedAtMs < KWS_DETECTION_COOLDOWN_MS) {
-            return
+            // 冷却期内：这是同一句话被重复识别，抑制它但保持监听。
+            Log.d(LOG_TAG, "[KWS] 冷却期内重复命中，忽略并继续监听：$keyword")
+            return false
         }
         lastDetectedAtMs = now
         shouldListen = false
@@ -241,6 +279,7 @@ class SherpaWakeWordRecognizer(
             },
             KWS_RELEASE_BEFORE_CAPTURE_MS,
         )
+        return true
     }
 
     private fun restartAfterIgnoredDetection() {
@@ -302,23 +341,47 @@ class SherpaWakeWordRecognizer(
     }
 
     private fun applyPreferredInputDevice(record: AudioRecord) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
-            return
-        }
-        val devices = audioManager.getDevices(AudioManager.GET_DEVICES_INPUTS)
-        val preferred = devices.firstOrNull(::isUsbInputDevice)
-            ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
-            ?: devices.firstOrNull()
+        // 走共享选择器：它会在"这一刻没有 USB/有线麦"时**等一小会儿**再退到板载麦。
+        // 这里是 KWS 的录音线程（后台），阻塞等待是安全的。
+        //
+        // 曾经的写法是就地查一次 getDevices() 然后一路 `?:` 退到板载麦 —— 而 USB 麦
+        // 常常在 App 启动之后才被枚举出来，于是唤醒器绑死在**没焊咪头**的板载通路上，
+        // 设备彻底听不见，界面却还写着"正在监听唤醒词"。（2026-09-21 真机事故）
+        val preferred = InputDeviceSelector.select(audioManager, preferBuiltin = useDeviceAec)
         preferred?.let { device ->
             runCatching { record.preferredDevice = device }
+            boundInputDevice = device
             Log.d(LOG_TAG, "[KWS] preferred input device=${device.productName} type=${device.type}")
-        }
+        } ?: Log.w(LOG_TAG, "[KWS] 没有可用的输入设备")
     }
 
-    private fun isUsbInputDevice(device: AudioDeviceInfo): Boolean {
-        return Build.VERSION.SDK_INT >= Build.VERSION_CODES.M &&
-            (device.type == AudioDeviceInfo.TYPE_USB_HEADSET ||
-                device.type == AudioDeviceInfo.TYPE_USB_DEVICE)
+    /**
+     * 监听期间复查输入设备，**绑错了就就地切过去**。
+     *
+     * 为什么需要这一层：本机唯一能拾音的是 USB 摄像头麦（card 2），板载 codec 的采集通路
+     * **没有焊咪头**（实测录到的是平坦噪声）。而 USB 音频设备常在 App 启动之后才被系统枚举出来
+     * —— 实测抓到同一个进程里，启动时只看到板载麦、一分多钟后 USB 麦才出现。
+     * [InputDeviceSelector] 已经在"选的那一刻"等了 2 秒，但如果 USB 麦是在 2 秒之后才出现的，
+     * 唤醒器就会一直绑在聋的板载麦上，**界面却还写着「正在监听唤醒词」**。
+     *
+     * `AudioRecord.setPreferredDevice` 支持在录音过程中改路由，所以不需要重启录音线程：
+     * 只要发现自己还绑在板载麦上、而 USB 麦已经出现，直接切过去就行。
+     */
+    private fun recheckInputDevice(record: AudioRecord) {
+        val current = boundInputDevice
+        // 已经绑在真正的麦克风上了，不用管。
+        if (current != null && current.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) return
+
+        val better = InputDeviceSelector.inputsOf(audioManager)
+            .firstOrNull(InputDeviceSelector::isUsbInput) ?: return
+
+        runCatching { record.preferredDevice = better }
+        boundInputDevice = better
+        Log.w(
+            LOG_TAG,
+            "[KWS] 之前绑在板载麦上（本机没有焊咪头，等于听不见），USB 麦克风出现后已自动切过去：" +
+                "${better.productName} type=${better.type}",
+        )
     }
 
     private fun normalizeKeywords(wakeWords: String): String {
