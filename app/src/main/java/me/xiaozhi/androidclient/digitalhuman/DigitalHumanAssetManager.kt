@@ -118,6 +118,18 @@ class DigitalHumanAssetManager(private val context: Context) {
     fun isComplete(role: RoleProfile): Boolean =
         DigitalHumanSlot.entries.all { role.videoPath(it).isNotBlank() && validate(role.videoPath(it)).isSuccess }
 
+    /**
+     * 删除**单个槽位**的视频文件。
+     *
+     * 为什么要单独做：原来的删除入口只有一个"清空全部"，一次把四段视频 + 头像 + 立绘
+     * 全删掉，而数字人素材是用户花时间一段段配出来的。用户原话——
+     * 「好不容易配好了，不小心按到垃圾桶，就直接全删了……总共也就 4 个，逐个删除也不算麻烦」。
+     */
+    fun deleteSlot(role: RoleProfile, slot: DigitalHumanSlot): Boolean {
+        val target = targetFor(role, slot)
+        return target.exists() && target.delete()
+    }
+
     fun deleteRoleAssets(roleId: String) {
         File(context.filesDir, "roles/${safe(roleId)}/digital-human").deleteRecursively()
     }

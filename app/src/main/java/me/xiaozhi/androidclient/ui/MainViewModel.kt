@@ -105,6 +105,9 @@ private const val SUPERVISION_VERIFY_DELAY_SECONDS = 60
  */
 private const val MAX_SUPERVISION_CHECKS = 5
 
+/** 输入设备健康巡检间隔。摄像头 USB 掉线要能被较快发现，但也不必每秒查。 */
+private const val MIC_CHECK_INTERVAL_MS = 5_000L
+
 /**
  * 立绘落盘时的长边上限。
  *
@@ -168,6 +171,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 还会再确认一次任务身份，所以等待期间任务被取消也不会拍到错的照片。
      */
     private val supervisionVerificationMutex = kotlinx.coroutines.sync.Mutex()
+
+    /** 输入设备健康巡检。每 [MIC_CHECK_INTERVAL_MS] 查一次，结果直接显示在底栏。 */
+    private var micHealthJob: Job? = null
+
+    /** 掉线警告只打一次，避免每几秒刷一条同样的日志。 */
+    private var microphoneWarningLogged: Boolean = false
     private var userRequestedDisconnect: Boolean = false
     private var conversationLoopActive: Boolean = false
     private var scheduledResumeCancelledByUser: Boolean = false
@@ -239,6 +248,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         audioEngine.setRouteStatusListener(::updateAudioRouteStatus)
+        startMicrophoneWatch()
         audioEngine.setDebugListener(::addLog)
         audioEngine.setDebugOptions(
             loggingEnabled = storedConfig.debugLoggingEnabled,
@@ -306,20 +316,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 }
             }
             outcome.onSuccess { path ->
-                if (role.id == RoleProfileRepository.DEFAULT_ROLE_ID) {
-                    updateAndPersist {
-                        copy(
-                            assistantAvatarPath = path,
-                            activeRoleAvatarPath = if (activeRoleId == role.id) path else activeRoleAvatarPath,
-                        )
-                    }
-                } else {
-                    saveAdditionalProfiles(
-                        roleProfiles.filterNot(::isPrimaryRole).map { profile ->
-                            if (profile.id == role.id) profile.copy(avatarPath = path) else profile
-                        },
-                    )
-                }
+                applyAvatarPath(role, path)
                 reloadRoleProfiles()
                 addLog("已更新${role.displayName}头像")
             }.onFailure { error ->
@@ -590,6 +587,50 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             })
         }
         reloadRoleProfiles()
+    }
+
+    /**
+     * 清掉某一段形象视频（只这一段）。
+     *
+     * 数字人素材是用户一段段配出来的，删除必须能**逐段**做——
+     * 原来的入口是数字人画面右上角一个垃圾桶图标，一下把四段视频 + 头像 + 立绘全删了，
+     * 而且没有任何确认。现在那个入口已经拿掉，改在角色编辑面板里逐段删。
+     */
+    fun clearRoleVideo(roleId: String, slot: DigitalHumanSlot) {
+        val role = roleProfiles.firstOrNull { it.id == roleId } ?: return
+        val removed = digitalHumanAssets.deleteSlot(role, slot)
+        updateRoleVideoPath(roleId, slot, "")
+        addLog(
+            if (removed) "已删除${role.displayName}的${slot.label}"
+            else "已清空${role.displayName}的${slot.label}（文件本来就不在）",
+        )
+    }
+
+    /** 清掉某个角色的头像。 */
+    fun clearRoleAvatar(roleId: String) {
+        val role = roleProfiles.firstOrNull { it.id == roleId } ?: return
+        deleteFileIfOwned(role.avatarPath)
+        applyAvatarPath(role, "")
+        reloadRoleProfiles()
+        addLog("已清除${role.displayName}头像")
+    }
+
+    /** 头像路径落库（主角色走 prefs，附加角色走 roles.json）——与导入共用同一条路。 */
+    private fun applyAvatarPath(role: RoleProfile, path: String) {
+        if (role.id == RoleProfileRepository.DEFAULT_ROLE_ID) {
+            updateAndPersist {
+                copy(
+                    assistantAvatarPath = path,
+                    activeRoleAvatarPath = if (activeRoleId == role.id) path else activeRoleAvatarPath,
+                )
+            }
+        } else {
+            saveAdditionalProfiles(
+                roleProfiles.filterNot(::isPrimaryRole).map { profile ->
+                    if (profile.id == role.id) profile.copy(avatarPath = path) else profile
+                },
+            )
+        }
     }
 
     /**
@@ -986,6 +1027,39 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }.onFailure { error ->
             refreshPythonRuntimeStatus()
             addLog("调用 termux-api 失败：${error.message.orEmpty()}")
+        }
+    }
+
+    /**
+     * 每隔几秒查一次"摄像头麦克风还在不在"，结果写进 UiState，由底栏常驻显示。
+     *
+     * 为什么必须常驻、而不是只在开机时查一次：USB 摄像头**会掉线**（实测 dmesg：
+     * `usb 7-1: can't read configurations, error -71`，重插 + 重启整机之后才回来）。
+     * 掉了之后设备既听不见也看不见，而界面上原本**只有一句「正在监听唤醒词」**——
+     * 用户完全不知道程序停在哪，只能靠猜。现在掉线会直接写在屏幕上，让人去查 USB。
+     */
+    private fun startMicrophoneWatch() {
+        micHealthJob?.cancel()
+        micHealthJob = viewModelScope.launch {
+            while (true) {
+                val health = runCatching { audioEngine.inputHealth() }.getOrNull()
+                if (health != null) {
+                    val ready = health.externalMicPresent
+                    updateState {
+                        copy(
+                            microphoneReady = ready,
+                            microphoneMessage = if (ready) "" else health.message,
+                        )
+                    }
+                    if (!ready && !microphoneWarningLogged) {
+                        microphoneWarningLogged = true
+                        addLog("⚠ ${health.message}")
+                    } else if (ready) {
+                        microphoneWarningLogged = false
+                    }
+                }
+                delay(MIC_CHECK_INTERVAL_MS)
+            }
         }
     }
 

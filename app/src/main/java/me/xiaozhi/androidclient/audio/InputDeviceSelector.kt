@@ -113,3 +113,43 @@ object InputDeviceSelector {
             ?: devices.first()
     }
 }
+
+/**
+ * 输入设备的健康状态。用于**开机自检**和**常驻提示**。
+ *
+ * 为什么要单独判"有没有 USB/有线麦"、而不是"有没有任何输入设备"：
+ * 这台板子的板载采集通路**没有焊咪头**，它在系统里永远是一个"存在但听不见"的设备，
+ * 所以"有输入设备"这个判据会永远为真、什么也发现不了。
+ * 产品形态上摄像头麦是标配，因此**它的在位与否才是真正的健康判据**。
+ */
+data class AudioInputHealth(
+    /** USB / 有线麦克风是否在位。 */
+    val externalMicPresent: Boolean,
+    /** 当前实际选中的设备名，给用户看。 */
+    val label: String,
+    /** 是否只有板载麦（本机意味着"听不见"）。 */
+    val onlyBuiltin: Boolean,
+) {
+    /** 一句话描述，可以直接显示给用户。 */
+    val message: String
+        get() = when {
+            externalMicPresent -> "麦克风：$label"
+            onlyBuiltin -> "没有检测到摄像头麦克风，请检查摄像头的 USB 连接"
+            else -> "没有检测到任何麦克风"
+        }
+}
+
+/**
+ * 查一次输入设备健康状态，**不等**（waitMs = 0）——它会被定期调用，不能阻塞。
+ */
+fun InputDeviceSelector.health(manager: AudioManager, preferBuiltin: Boolean): AudioInputHealth {
+    val devices = inputsOf(manager)
+    val external = devices.firstOrNull(::isUsbInput) ?: devices.firstOrNull(::isWiredInput)
+    val builtin = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
+    val chosen = if (preferBuiltin) builtin ?: external else external ?: builtin
+    return AudioInputHealth(
+        externalMicPresent = external != null,
+        label = chosen?.productName?.toString().orEmpty().ifBlank { "未知设备" },
+        onlyBuiltin = external == null && builtin != null,
+    )
+}

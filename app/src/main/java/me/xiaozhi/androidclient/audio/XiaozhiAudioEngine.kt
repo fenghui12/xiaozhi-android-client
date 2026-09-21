@@ -557,6 +557,15 @@ class XiaozhiAudioEngine(context: Context) {
     private fun findPreferredInputDevice(): AudioDeviceInfo? =
         InputDeviceSelector.select(audioManager, preferBuiltin = useDeviceAec, waitMs = 0)
 
+    /**
+     * 当前输入设备能不能真的拾音。给开机自检和常驻提示用，**不阻塞**。
+     *
+     * 判据是"USB/有线麦克风在不在位"，而不是"有没有输入设备"——本机板载采集通路
+     * 没有焊咪头，它在系统里永远存在，用后者永远发现不了问题。
+     */
+    fun inputHealth(): AudioInputHealth =
+        InputDeviceSelector.health(audioManager, preferBuiltin = useDeviceAec)
+
     private fun findPreferredOutputDevice(): AudioDeviceInfo? {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.M) {
             return null

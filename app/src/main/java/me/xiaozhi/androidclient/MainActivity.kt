@@ -52,7 +52,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Timer
@@ -170,6 +169,9 @@ private const val UI_FONT_SCALE = 1.18f
 
 /** 启动进度界面最多挡这么久，避免没网时把用户锁在 Loading 上。 */
 private const val STARTUP_OVERLAY_TIMEOUT_MS = 25_000L
+
+/** 自检界面最短显示时长——太短就读不到自检结论，等于没做自检。 */
+private const val STARTUP_OVERLAY_MIN_MS = 2_500L
 
 // 立绘解码的像素上限与采样率算法已挪到 util/ImageSampling.kt —— 那是纯函数，
 // 可以在 JVM 单元测试里直接验证，不必起真机。这里不再保留同名常量，避免两份定义走偏。
@@ -455,7 +457,9 @@ private fun XiaozhiApp() {
             }
         },
         onAbortSpeaking = viewModel::abortSpeaking,
-        onClearRoleMedia = { roleId -> viewModel.clearRoleMedia(roleId) },
+        onClearRoleAvatar = { roleId -> viewModel.clearRoleAvatar(roleId) },
+        onClearRolePortrait = { roleId -> viewModel.clearRolePortrait(roleId) },
+        onClearRoleVideo = { roleId, slot -> viewModel.clearRoleVideo(roleId, slot) },
     )
     if (uploadSession != null) {
         UploadQrDialog(
@@ -551,19 +555,41 @@ private fun XiaozhiScreen(
     onStartUpdate: () -> Unit,
     onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
     onAbortSpeaking: () -> Unit,
-    onClearRoleMedia: (String) -> Unit,
+    onClearRoleAvatar: (String) -> Unit,
+    onClearRolePortrait: (String) -> Unit,
+    onClearRoleVideo: (String, DigitalHumanSlot) -> Unit,
 ) {
     var everConnected by rememberSaveable { mutableStateOf(false) }
     var startupGraceElapsed by rememberSaveable { mutableStateOf(false) }
+    // 自检界面至少要让人看清自检结果。实测 App 只要一两秒就连上了，
+    // "连上就让位"会让整层一闪而过——那几行自检结论根本来不及读，等于没做自检。
+    var startupMinShown by remember { mutableStateOf(false) }
     LaunchedEffect(state.connectionStatus) {
         if (state.connectionStatus == ConnectionStatus.CONNECTED) everConnected = true
+    }
+    LaunchedEffect(Unit) {
+        delay(STARTUP_OVERLAY_MIN_MS)
+        startupMinShown = true
     }
     LaunchedEffect(Unit) {
         delay(STARTUP_OVERLAY_TIMEOUT_MS)
         startupGraceElapsed = true
     }
+    // 用户看到麦克风自检失败的提示后，可以主动收起这层继续用（避免卡死）。
+    var startupOverlayDismissed by rememberSaveable { mutableStateOf(false) }
+
     // 连上过一次、或者等了足够久（没网也不能永远挡着界面），就让位给正常界面。
-    val showStartupOverlay = !everConnected && !startupGraceElapsed
+    //
+    // **但麦克风自检没通过时不让位。** 实测 App 连得太快，"连上就让位"会让这层只闪
+    // 不到两秒——那行红色的「没有检测到摄像头麦克风」根本来不及看，等于没提示。
+    // 而麦克风掉了意味着这台设备**完全没法交互**（它唯一的麦克风在 USB 摄像头上），
+    // 正是最该把话说清楚的时候。想继续用的人可以点「仍然继续」。
+    val showStartupOverlay = !startupOverlayDismissed &&
+        (
+            !startupMinShown ||
+                (!everConnected && !startupGraceElapsed) ||
+                !state.microphoneReady
+            )
 
     Scaffold(
         containerColor = if (currentScreen == AppScreen.SETTINGS) SettingsBackground else ChatBackground,
@@ -588,7 +614,6 @@ private fun XiaozhiScreen(
                     padding = padding,
                     onOpenSettings = onOpenSettings,
                     onAbortSpeaking = onAbortSpeaking,
-                    onClearRoleMedia = onClearRoleMedia,
                 )
 
                 AppScreen.SETTINGS -> SettingsScreen(
@@ -604,13 +629,25 @@ private fun XiaozhiScreen(
                     onCheckForUpdate = onCheckForUpdate,
                     onStartUpdate = onStartUpdate,
                     onStartVideoUpload = onStartVideoUpload,
+                    onClearRoleAvatar = onClearRoleAvatar,
+                    onClearRolePortrait = onClearRolePortrait,
+                    onClearRoleVideo = onClearRoleVideo,
                 )
             }
 
             // 冷启动期间盖一层明确的进度界面：测试者把“开机后什么都没有”
             // 直接理解成了死机，第一反应是拔电源。
             if (showStartupOverlay) {
-                StartupLoadingOverlay(state = state)
+                StartupLoadingOverlay(
+                    state = state,
+                    // 只有"麦克风坏了且不是刚开机那几秒"才给出口，
+                    // 免得正常启动时冒出一个多余的按钮。
+                    onContinueAnyway = if (!state.microphoneReady && startupMinShown) {
+                        { startupOverlayDismissed = true }
+                    } else {
+                        null
+                    },
+                )
             }
         }
     }
@@ -618,7 +655,7 @@ private fun XiaozhiScreen(
 
 /** 启动自检期间的全屏进度提示；连上过一次或超时后自动让位。 */
 @Composable
-private fun StartupLoadingOverlay(state: UiState) {
+private fun StartupLoadingOverlay(state: UiState, onContinueAnyway: (() -> Unit)? = null) {
     Box(
         modifier = Modifier
             .fillMaxSize()
@@ -645,11 +682,45 @@ private fun StartupLoadingOverlay(state: UiState) {
                 style = MaterialTheme.typography.bodyLarge,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
-            Text(
-                text = "首次启动需要联网自检，通常几秒钟",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            // 摄像头麦克风自检。**这是"能不能交互"的前提**：本机唯一的麦克风就在
+            // USB 摄像头上，它掉了设备既听不见也看不见。以前这种情况界面上只有一句
+            // 「正在连接小智服务…」，用户根本不知道程序停在哪，只能猜。现在直接写出来。
+            if (state.microphoneReady) {
+                Text(
+                    text = "麦克风：已就绪 ✓",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF16A34A),
+                )
+            } else {
+                Surface(
+                    color = Color(0xFFFEF2F2),
+                    shape = RoundedCornerShape(10.dp),
+                    border = BorderStroke(1.dp, Color(0xFFFCA5A5)),
+                    modifier = Modifier.padding(horizontal = 24.dp),
+                ) {
+                    Text(
+                        text = "⚠ ${state.microphoneMessage.ifBlank { "没有检测到摄像头麦克风" }}",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color(0xFFB91C1C),
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    )
+                }
+            }
+            if (onContinueAnyway != null) {
+                Text(
+                    text = "接好摄像头后这行提示会自动消失，不用重启",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                TextButton(onClick = onContinueAnyway) { Text("仍然继续") }
+            } else {
+                Text(
+                    text = "首次启动需要联网自检，通常几秒钟",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
         }
     }
 }
@@ -660,7 +731,6 @@ private fun ChatScreen(
     padding: PaddingValues,
     onOpenSettings: () -> Unit,
     onAbortSpeaking: () -> Unit,
-    onClearRoleMedia: (String) -> Unit,
 ) {
     val listState = rememberLazyListState()
     // 数字人就绪时是否盖住聊天区。用户可以随时切回聊天——
@@ -730,7 +800,6 @@ private fun ChatScreen(
                 DigitalHumanControlBar(
                     onShowChat = { showDigitalHuman = false },
                     onOpenSettings = onOpenSettings,
-                    onClearMedia = { onClearRoleMedia(state.activeRoleId) },
                 )
             }
             Spacer(modifier = Modifier.weight(1f))
@@ -801,7 +870,6 @@ private fun digitalHumanStatusLabel(state: UiState): String = when {
 private fun DigitalHumanControlBar(
     onShowChat: () -> Unit,
     onOpenSettings: () -> Unit,
-    onClearMedia: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Surface(
@@ -819,9 +887,6 @@ private fun DigitalHumanControlBar(
             }
             IconButton(onClick = onOpenSettings) {
                 Icon(Icons.Default.Settings, contentDescription = "设置", tint = Color.White)
-            }
-            IconButton(onClick = onClearMedia) {
-                Icon(Icons.Default.Delete, contentDescription = "清空数字人素材", tint = Color.White)
             }
         }
     }
@@ -1146,6 +1211,9 @@ private fun SettingsScreen(
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
     onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
+    onClearRoleAvatar: (String) -> Unit,
+    onClearRolePortrait: (String) -> Unit,
+    onClearRoleVideo: (String, DigitalHumanSlot) -> Unit,
 ) {
     val scrollState = rememberScrollState()
 
@@ -1165,6 +1233,9 @@ private fun SettingsScreen(
             onPickRolePortrait = onPickRolePortrait,
             onPickRoleVideo = onPickRoleVideo,
             onStartVideoUpload = onStartVideoUpload,
+            onClearRoleAvatar = onClearRoleAvatar,
+            onClearRolePortrait = onClearRolePortrait,
+            onClearRoleVideo = onClearRoleVideo,
             onAddRole = onAddRole,
             onUpdateRole = onUpdateRole,
             onDeleteRole = onDeleteRole,
@@ -1357,6 +1428,9 @@ private fun RoleProfilesCard(
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
     onDeleteRole: (String) -> Unit,
+    onClearRoleAvatar: (String) -> Unit,
+    onClearRolePortrait: (String) -> Unit,
+    onClearRoleVideo: (String, DigitalHumanSlot) -> Unit,
 ) {
     var editingRoleId by remember { mutableStateOf<String?>(null) }
     var addingRole by remember { mutableStateOf(false) }
@@ -1420,6 +1494,9 @@ private fun RoleProfilesCard(
             role = editingRole,
             onPickAvatar = { editingRole?.id?.let(onPickRoleAvatar) },
             onPickPortrait = { editingRole?.id?.let(onPickRolePortrait) },
+            onClearAvatar = { editingRole?.id?.let(onClearRoleAvatar) },
+            onClearPortrait = { editingRole?.id?.let(onClearRolePortrait) },
+            onClearVideo = { slot -> editingRole?.id?.let { onClearRoleVideo(it, slot) } },
             onPickVideo = { slot -> editingRole?.id?.let { onPickRoleVideo(it, slot) } },
             onStartVideoUpload = { slot ->
                 val targetRole = editingRole
@@ -1499,6 +1576,9 @@ private fun RoleEditorDialog(
     onPickPortrait: () -> Unit,
     onPickVideo: (DigitalHumanSlot) -> Unit,
     onStartVideoUpload: (DigitalHumanSlot) -> Unit,
+    onClearAvatar: () -> Unit,
+    onClearPortrait: () -> Unit,
+    onClearVideo: (DigitalHumanSlot) -> Unit,
     onDismiss: () -> Unit,
     onSave: (String, String) -> Unit,
 ) {
@@ -1521,6 +1601,11 @@ private fun RoleEditorDialog(
                             modifier = Modifier.size(64.dp),
                         )
                         OutlinedButton(onClick = onPickAvatar) { Text("更换头像") }
+                        if (role.avatarPath.isNotBlank() && File(role.avatarPath).exists()) {
+                            TextButton(onClick = onClearAvatar) {
+                                Text("清除", color = InterruptRed)
+                            }
+                        }
                     }
                     Row(
                         modifier = Modifier.fillMaxWidth(),
@@ -1534,7 +1619,14 @@ private fun RoleEditorDialog(
                                 "角色立绘 · 未配置"
                             },
                         )
-                        OutlinedButton(onClick = onPickPortrait) { Text("选择立绘") }
+                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                            OutlinedButton(onClick = onPickPortrait) { Text("选择立绘") }
+                            if (role.portraitPath.isNotBlank() && File(role.portraitPath).exists()) {
+                                TextButton(onClick = onClearPortrait) {
+                                    Text("删除", color = InterruptRed)
+                                }
+                            }
+                        }
                     }
                     Text(
                         text = "四段形象视频没配齐时，用这张立绘当角色形象",
@@ -1562,6 +1654,13 @@ private fun RoleEditorDialog(
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 OutlinedButton(onClick = { onPickVideo(slot) }) { Text("本机") }
                                 OutlinedButton(onClick = { onStartVideoUpload(slot) }) { Text("扫码") }
+                                // 逐段删除。原来只有一个"清空全部"的垃圾桶入口，
+                                // 一次把四段视频 + 头像 + 立绘全删掉，用户说"成本太大"。
+                                if (configured) {
+                                    TextButton(onClick = { onClearVideo(slot) }) {
+                                        Text("删除", color = InterruptRed)
+                                    }
+                                }
                             }
                         }
                     }
@@ -1625,6 +1724,13 @@ private fun ComposerCard(
                 //   * 待机   → 小智最后说过的一句；一句都没有时提示怎么叫它。
                 // 客户之前问过"为什么有动画的角色反而不显示文字"——这条就是那个文字。
                 val subtitle = when {
+                    // **麦克风掉线要盖过一切。**
+                    // 此时设备既听不见也看不见，其他任何文案（「正在聆听」「正在播放」）
+                    // 说的都不是真的——用户会一直以为它在听，其实它已经聋了。
+                    // 实测过：USB 摄像头掉线（dmesg: error -71）时界面原本只有
+                    // 「正在监听唤醒词」，用户只能靠猜。
+                    !state.microphoneReady ->
+                        "⚠ ${state.microphoneMessage.ifBlank { "没有检测到摄像头麦克风，请检查 USB 连接" }}"
                     // **播报要排在聆听前面。**
                     // 播报期间麦克风是继续工作的（为了支持语音打断），所以 isRecording 也为 true。
                     // 顺序反了就会出现同一屏上顶栏写「讲话中」、底部写「正在聆听」的自相矛盾
@@ -1652,11 +1758,12 @@ private fun ComposerCard(
                     Text(
                         text = subtitle,
                         style = MaterialTheme.typography.bodyMedium,
-                        color = if (state.isAssistantSpeaking) {
-                            MaterialTheme.colorScheme.onSurface
-                        } else {
-                            MaterialTheme.colorScheme.onSurfaceVariant
+                        color = when {
+                            !state.microphoneReady -> Color(0xFFB91C1C)
+                            state.isAssistantSpeaking -> MaterialTheme.colorScheme.onSurface
+                            else -> MaterialTheme.colorScheme.onSurfaceVariant
                         },
+                        fontWeight = if (!state.microphoneReady) FontWeight.Bold else null,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )

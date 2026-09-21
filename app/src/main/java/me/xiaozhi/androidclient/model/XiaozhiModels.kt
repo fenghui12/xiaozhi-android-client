@@ -131,6 +131,17 @@ data class UiState(
     val activeRoleId: String = "xiaozhi",
     val roleProfiles: List<RoleProfile> = emptyList(),
     val wakeWordStatus: String = "",
+
+    /**
+     * 摄像头麦克风在位吗。**开机自检与底栏常驻提示都用它。**
+     *
+     * 判据是"USB/有线麦克风在不在位"，而不是"有没有输入设备"——这台板子的板载采集通路
+     * 没有焊咪头，它在系统里永远存在，用后者永远发现不了问题。
+     */
+    val microphoneReady: Boolean = true,
+
+    /** 给用户看的一句话：没有麦克风时说明原因和怎么办。 */
+    val microphoneMessage: String = "",
     val termuxEnabled: Boolean = false,
     val pythonPath: String = "",
     val pythonScriptPath: String = "",
