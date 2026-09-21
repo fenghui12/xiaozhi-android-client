@@ -10,6 +10,7 @@ import android.view.ViewGroup
 import android.widget.FrameLayout
 import android.widget.VideoView
 import android.graphics.Bitmap
+import android.graphics.BitmapFactory
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -30,6 +31,7 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -111,7 +113,9 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.withContext
 import coil.compose.AsyncImage
 import me.xiaozhi.androidclient.audio.SherpaWakeWordRecognizer
 import me.xiaozhi.androidclient.model.ChatMessage
@@ -120,6 +124,7 @@ import me.xiaozhi.androidclient.model.ConnectionStatus
 import me.xiaozhi.androidclient.model.ListeningMode
 import me.xiaozhi.androidclient.model.LogLine
 import me.xiaozhi.androidclient.model.RoleProfile
+import me.xiaozhi.androidclient.util.ImageSampling
 import me.xiaozhi.androidclient.model.ScheduledTaskUi
 import me.xiaozhi.androidclient.model.UiState
 import me.xiaozhi.androidclient.model.DigitalHumanSlot
@@ -166,6 +171,17 @@ private const val UI_FONT_SCALE = 1.18f
 
 /** 启动进度界面最多挡这么久，避免没网时把用户锁在 Loading 上。 */
 private const val STARTUP_OVERLAY_TIMEOUT_MS = 25_000L
+
+// 立绘解码的像素上限与采样率算法已挪到 util/ImageSampling.kt —— 那是纯函数，
+// 可以在 JVM 单元测试里直接验证，不必起真机。这里不再保留同名常量，避免两份定义走偏。
+
+/**
+ * 「当前任务」列表的最大高度（约 3 行）。超出部分滚动查看。
+ *
+ * 目的是**给底部的麦克风和「打断」按钮留出位置**：定时任务条数没有上限，
+ * 不限高的话任务面板会把底部操作条顶出屏幕，那两个最常用的按钮就点不到了。
+ */
+private val TASK_LIST_MAX_HEIGHT = 186.dp
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -850,24 +866,59 @@ private fun DigitalHumanSwitchChip(label: String, onClick: () -> Unit) {
  */
 @Composable
 private fun PortraitPanel(path: String, modifier: Modifier = Modifier) {
-    val bitmap = remember(path) {
-        runCatching { android.graphics.BitmapFactory.decodeFile(path) }.getOrNull()
+    // 立绘是用户自己上传的照片，分辨率可能非常大——8000x6000 的照片按 ARGB_8888
+    // 全尺寸解码约 183 MiB。直接用 BitmapFactory.decodeFile 有两重风险：
+    //   1. 在组合线程上同步解码大图，界面会卡住；
+    //   2. 位图超过硬件 Canvas 的绘制上限时抛 "Canvas: trying to draw too large bitmap"，
+    //      而这里的 runCatching 只包得住**解码**、包不住**绘制**，所以照样会崩。
+    // 立绘本来就按 Crop 铺满全屏显示，超过屏幕的部分根本看不见，按屏幕尺寸下采样即可。
+    //
+    // 解码必须放到 IO 线程：实测一张 18540x23437 / 14.85 MB 的 JPEG，
+    // 即使下采样到 1158x1464，libjpeg 仍要通读整个文件，放在组合线程会直接冻住界面。
+    var bitmap by remember(path) { mutableStateOf<Bitmap?>(null) }
+    var decodeFailed by remember(path) { mutableStateOf(false) }
+    LaunchedEffect(path) {
+        decodeFailed = false
+        val decoded = withContext(Dispatchers.IO) {
+            runCatching { decodeSampledBitmap(path, maxWidthPx = 1080, maxHeightPx = 1920) }.getOrNull()
+        }
+        bitmap = decoded
+        decodeFailed = decoded == null
     }
     Box(
         modifier = modifier.background(Color(0xFF0B1016)),
         contentAlignment = Alignment.Center,
     ) {
-        if (bitmap != null) {
-            Image(
-                bitmap = bitmap.asImageBitmap(),
+        val shown = bitmap
+        when {
+            shown != null -> Image(
+                bitmap = shown.asImageBitmap(),
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
                 modifier = Modifier.fillMaxSize(),
             )
-        } else {
-            Text("立绘无法读取", color = Color.White)
+            // 解码期间保持纯色底，不要把"无法读取"当作加载态闪一下。
+            !decodeFailed -> Unit
+            else -> Text("立绘无法读取", color = Color.White)
         }
     }
+}
+
+/**
+ * 按目标尺寸采样解码图片。两步走：先只读边界（`inJustDecodeBounds`，不解码像素），
+ * 由 [ImageSampling] 算出 `inSampleSize`，再真正解码。
+ *
+ * 采样算术刻意放在 [ImageSampling] 里而不是内联在这里——它是"防止大图把整机拖垮"
+ * 的核心逻辑，必须能在 JVM 单元测试里直接验证（见 `ImageSamplingTest`）。
+ */
+private fun decodeSampledBitmap(path: String, maxWidthPx: Int, maxHeightPx: Int): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeFile(path, bounds)
+    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return null
+
+    val sample = ImageSampling.portraitSampleSize(bounds.outWidth, bounds.outHeight, maxWidthPx, maxHeightPx)
+
+    return BitmapFactory.decodeFile(path, BitmapFactory.Options().apply { inSampleSize = sample })
 }
 
 @Composable
@@ -1021,9 +1072,23 @@ private fun CurrentTasksPanel(tasks: List<ScheduledTaskUi>) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            tasks.forEachIndexed { index, task ->
-                if (index > 0) HorizontalDivider(modifier = Modifier.padding(horizontal = 14.dp))
-                CurrentTaskRow(task)
+            // 任务列表限高 + 可滚动。
+            //
+            // 定时任务**条数没有上限**（只有监督任务限 5 个），而这里是逐条全展开、
+            // 既不限高也不滚动的。条数一多，外层 Column 的固定高度子项加起来就会超出
+            // 可用高度，**把底部的 ComposerCard 顶出屏幕**——麦克风和「打断」都点不到了，
+            // 而那是这台设备最常用的两个按钮。这里把列表限制在几行以内并允许滚动，
+            // 保证底部操作条永远有位置。
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = TASK_LIST_MAX_HEIGHT)
+                    .verticalScroll(rememberScrollState()),
+            ) {
+                tasks.forEachIndexed { index, task ->
+                    if (index > 0) HorizontalDivider(modifier = Modifier.padding(horizontal = 14.dp))
+                    CurrentTaskRow(task)
+                }
             }
         }
     }
@@ -1306,6 +1371,11 @@ private fun RoleProfilesCard(
 ) {
     var editingRoleId by remember { mutableStateOf<String?>(null) }
     var addingRole by remember { mutableStateOf(false) }
+    // 待确认删除的角色。删除是**不可撤销**的，而且会连带丢掉这个角色的
+    // 唤醒词、立绘、头像和四段形象视频——所以不能一点就走。
+    // 2026-09-21 用户模拟测试的原话：「删除和编辑并排、同样大小、同样样式，
+    // 只差文字——误触成本不对等」，实测一次点击角色就没了。
+    var pendingDelete by remember { mutableStateOf<RoleProfile?>(null) }
     val editingRole = state.roleProfiles.firstOrNull { it.id == editingRoleId }
 
     SettingsCard {
@@ -1315,7 +1385,7 @@ private fun RoleProfilesCard(
                 active = role.id == state.activeRoleId,
                 onSelect = { onSelectRole(role.id) },
                 onEdit = { editingRoleId = role.id },
-                onDelete = { onDeleteRole(role.id) },
+                onDelete = { pendingDelete = role },
             )
             if (index < state.roleProfiles.lastIndex) HorizontalDivider()
         }
@@ -1328,6 +1398,32 @@ private fun RoleProfilesCard(
         ) {
             Text("添加角色")
         }
+    }
+
+    pendingDelete?.let { target ->
+        AlertDialog(
+            onDismissRequest = { pendingDelete = null },
+            title = { Text("删除角色「${target.displayName}」？") },
+            text = {
+                Text(
+                    "这个角色的唤醒词、立绘、头像和形象视频都会一起删掉，删了没法恢复。" +
+                        "如果只是暂时不想用它，可以留着不切换。",
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        pendingDelete = null
+                        onDeleteRole(target.id)
+                    },
+                ) {
+                    Text("删除", color = InterruptRed, fontWeight = FontWeight.Bold)
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { pendingDelete = null }) { Text("取消") }
+            },
+        )
     }
 
     if (editingRole != null || addingRole) {
@@ -1527,8 +1623,13 @@ private fun ComposerCard(
         ) {
             if (state.isRecording || state.isAssistantSpeaking || state.lastSttText.isNotBlank()) {
                 val hint = when {
-                    state.isRecording -> "正在聆听，说完会自动结束"
+                    // **播报要排在聆听前面。**
+                    // 播报期间麦克风是继续工作的（为了支持语音打断），所以 isRecording 也为 true。
+                    // 旧的顺序让 isRecording 先命中，于是同一屏上顶栏写「讲话中」、底部写「正在聆听」——
+                    // 2026-09-21 用户模拟测试把它当成一处自相矛盾的提示报了出来。
+                    // 此刻用户真正需要知道的是"它在说话、按右边那颗红键可以让它闭嘴"。
                     state.isAssistantSpeaking -> "正在播报，点右边红色「打断」可以立刻让它闭嘴"
+                    state.isRecording -> "正在聆听，说完会自动结束"
                     state.lastSttText.isNotBlank() -> state.lastSttText
                     else -> ""
                 }

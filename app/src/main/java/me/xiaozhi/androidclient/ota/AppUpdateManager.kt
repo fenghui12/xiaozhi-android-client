@@ -2,6 +2,8 @@ package me.xiaozhi.androidclient.ota
 
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageInfo
+import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import androidx.core.content.FileProvider
@@ -23,10 +25,16 @@ class AppUpdateManager(
     private val baseHttpClient: OkHttpClient,
     private val updateIndexUrl: String = DEFAULT_UPDATE_INDEX_URL,
 ) {
-    /** 下载 54MB 安装包用：超时给得宽，弱网下也不至于半途而废。 */
+    /** 下载 54MB 安装包用。
+     *
+     * 读超时从 300 秒收紧到 30 秒：读超时是**单次 read 无数据**的上限，健康的连接
+     * 不可能 30 秒一个字节都收不到。之前 300 秒意味着连接一旦中途死掉，进度条会
+     * 停住不动干等整整五分钟才回退到下一个源（2026-09-17 实测复现过：停在 9%
+     * 五分钟）。30 秒足够慢速但活着的连接继续，又能让死连接快速暴露。
+     */
     private val httpClient = baseHttpClient.newBuilder()
         .connectTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-        .readTimeout(300, java.util.concurrent.TimeUnit.SECONDS)
+        .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .writeTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .followRedirects(true)
         .followSslRedirects(true)
@@ -136,7 +144,13 @@ class AppUpdateManager(
             for (url in candidateUrls) {
                 try {
                     android.util.Log.d("AppUpdateManager", "Trying to download APK from: $url")
-                    finalApkFile = attemptDownload(url, info)
+                    val candidate = attemptDownload(url, info)
+                    // 校验放进循环里：某个源返回 HTTP 200 但内容是错误页 / 旧包 /
+                    // 缓存串了的时候，应该换下一个源重试，而不是直接判整个升级失败。
+                    // 旧写法是先 break 出循环再校验，一旦第一个源的内容不对，
+                    // 后面健康的源永远不会被尝试。
+                    verifyDownloadedApk(candidate, info)
+                    finalApkFile = candidate
                     break
                 } catch (e: Exception) {
                     android.util.Log.w("AppUpdateManager", "Download failed from $url: ${e.message}")
@@ -146,15 +160,6 @@ class AppUpdateManager(
 
             val apkFile = finalApkFile ?: throw (lastError ?: IllegalStateException("所有下载源均失败"))
 
-            _downloadState.value = DownloadProgressState.Verifying
-            if (info.sha256.isNotBlank()) {
-                val actualSha256 = calculateSha256(apkFile)
-                if (!actualSha256.equals(info.sha256, ignoreCase = true)) {
-                    apkFile.delete()
-                    throw IllegalStateException("安装包 SHA-256 校验失败 (预期: ${info.sha256}, 实际: $actualSha256)")
-                }
-            }
-
             downloadedApkFile = apkFile
             _downloadState.value = DownloadProgressState.ReadyToInstall
             onSuccess(apkFile)
@@ -162,6 +167,99 @@ class AppUpdateManager(
         }.onFailure { err ->
             _downloadState.value = DownloadProgressState.Failed(err.message ?: "下载失败")
         }
+    }
+
+    /**
+     * 安装包校验。**这是防「镜像投毒」的关键一环。**
+     *
+     * 背景：`version.json`（含 versionCode / downloadUrl / sha256）本身也是从镜像拉的，
+     * 所以镜像可以**同时伪造**版本描述和哈希。而下面 `installApk()` 会先尝试
+     * `su 0 pm install`（root 静默安装），且 `pm install` 不检查"是不是在升级同一个应用"——
+     * 换句话说，一个被投毒的镜像原本就能让设备装上**任意包名的任意 APK**。
+     *
+     * 包名和签名证书是写死在应用里的，镜像伪造不了，所以拿它们做最后一道闸门：
+     * 三者（哈希、包名、签名）全部通过才允许安装。
+     */
+    private fun verifyDownloadedApk(apkFile: File, info: OtaVersionInfo) {
+        _downloadState.value = DownloadProgressState.Verifying
+
+        // 1) SHA-256：必须存在且匹配。
+        //    旧写法在 sha256 为空时会**跳过**校验，等于给"配置被篡改或截断"留了后门。
+        if (info.sha256.isBlank()) {
+            apkFile.delete()
+            throw IllegalStateException("更新配置缺少 sha256，拒绝安装")
+        }
+        val actualSha256 = calculateSha256(apkFile)
+        if (!actualSha256.equals(info.sha256, ignoreCase = true)) {
+            apkFile.delete()
+            throw IllegalStateException("安装包 SHA-256 校验失败 (预期: ${info.sha256}, 实际: $actualSha256)")
+        }
+
+        // 2) 包名 + 签名证书：确认下载到的确实是"我们自己的"安装包。
+        val archive = context.packageManager
+            .getPackageArchiveInfo(apkFile.absolutePath, archiveInfoFlags)
+            ?: run {
+                apkFile.delete()
+                throw IllegalStateException("安装包无法解析，可能已损坏")
+            }
+        if (archive.packageName != context.packageName) {
+            apkFile.delete()
+            throw IllegalStateException(
+                "安装包包名不匹配 (预期 ${context.packageName}，实际 ${archive.packageName})，拒绝安装",
+            )
+        }
+        val signer = signerSha256(archive)
+        if (signer == null) {
+            apkFile.delete()
+            throw IllegalStateException("安装包没有签名信息，拒绝安装")
+        }
+        if (!signer.equals(EXPECTED_SIGNER_SHA256, ignoreCase = true)) {
+            apkFile.delete()
+            throw IllegalStateException("安装包签名不匹配 (实际 $signer)，拒绝安装")
+        }
+
+        // 3) 版本号一致性：配置里报的版本必须和包内声明的版本一致。
+        //    不一致说明配置和包对不上（配置写错或被人拼装过）。放过去的话，
+        //    设备可能装上一个比配置里更低的版本，然后被反复提示同一个更新。
+        //    longVersionCode 是 API 28 才有的，minSdk 26 要走回退分支。
+        val apkVersionCode = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            archive.longVersionCode
+        } else {
+            @Suppress("DEPRECATION")
+            archive.versionCode.toLong()
+        }
+        if (apkVersionCode != info.versionCode.toLong()) {
+            apkFile.delete()
+            throw IllegalStateException(
+                "安装包版本与更新配置不一致 (配置 ${info.versionCode}，实际 $apkVersionCode)",
+            )
+        }
+    }
+
+    private val archiveInfoFlags: Int
+        get() = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            @Suppress("DEPRECATION")
+            PackageManager.GET_SIGNATURES
+        }
+
+    private fun signerSha256(info: PackageInfo): String? {
+        val signatures = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val signingInfo = info.signingInfo ?: return null
+            if (signingInfo.hasMultipleSigners()) {
+                signingInfo.apkContentsSigners
+            } else {
+                signingInfo.signingCertificateHistory
+            }
+        } else {
+            @Suppress("DEPRECATION")
+            info.signatures
+        }
+        val first = signatures?.firstOrNull() ?: return null
+        return MessageDigest.getInstance("SHA-256")
+            .digest(first.toByteArray())
+            .joinToString("") { "%02x".format(it) }
     }
 
     private fun attemptDownload(url: String, info: OtaVersionInfo): File {
@@ -215,6 +313,22 @@ class AppUpdateManager(
 
     fun installApk(apkFile: File): Boolean {
         if (!apkFile.exists()) return false
+
+        // 闸门：只允许安装**刚刚通过完整校验的那个文件**。
+        // installApk 是公开方法，任何人拿到一个路径都能调；而下面第一条路径是
+        // root 静默安装，一旦被传进别的 APK，后果是"静默装上任意应用"。
+        //
+        // `canonicalPath` 声明会抛 IOException（路径里有解析不了的符号链接、
+        // 或父目录被 SELinux 拒绝读取），而 installApk 返回 Boolean、
+        // 调用方没有任何 try —— 异常逃出去会直接打断升级协程。
+        // 按"拒绝安装"处理，与本闸门 fail-closed 的意图一致。
+        val sameFile = runCatching {
+            apkFile.canonicalPath == downloadedApkFile?.canonicalPath
+        }.getOrDefault(false)
+        if (!sameFile) {
+            android.util.Log.e("AppUpdateManager", "拒绝安装未经校验的安装包: ${apkFile.absolutePath}")
+            return false
+        }
 
         // 1. 优先尝试系统级静默安装 (适用于有 root 权限或 RK3568 工控板预置系统命令)
         if (trySilentInstall(apkFile)) {
@@ -288,5 +402,15 @@ class AppUpdateManager(
     companion object {
         const val DEFAULT_UPDATE_INDEX_URL =
             "https://raw.githubusercontent.com/fenghui12/xiaozhi-android-client/dev-main/version.json"
+
+        /**
+         * 本应用签名证书的 SHA-256。**这是防镜像投毒的最后一道闸门，改动前务必想清楚。**
+         *
+         * 对应 `~/.android/debug.keystore`（v1.2.1 起所有对外发布版本都用它签名，
+         * 见 `docs` 里的发布记录）。换签名密钥时必须同步改这里，否则所有设备
+         * 都会拒绝安装新版本——那是"升级永久失效"，比装不上一个包严重得多。
+         */
+        const val EXPECTED_SIGNER_SHA256 =
+            "cf16874766d4d343c9e67795adf12b5f12cb3e1096122e73cdde42d7b34dc835"
     }
 }

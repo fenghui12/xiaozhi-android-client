@@ -17,22 +17,81 @@ data class DigitalHumanVideoInfo(
 
 class DigitalHumanAssetManager(private val context: Context) {
     fun importVideo(role: RoleProfile, slot: DigitalHumanSlot, source: Uri): Result<String> = runCatching {
-        val resolver = context.contentResolver
-        val targetDir = File(context.filesDir, "roles/${safe(role.id)}/digital-human").apply { mkdirs() }
-        val target = File(targetDir, "${slot.wireName}.mp4")
-        resolver.openInputStream(source)?.use { input ->
-            target.outputStream().use { output -> input.copyTo(output) }
-        } ?: error("无法读取视频文件")
-        validate(target).getOrThrow()
+        val target = targetFor(role, slot)
+        replaceAtomically(target) { temp ->
+            context.contentResolver.openInputStream(source)?.use { input ->
+                copyWithLimit(input, temp)
+            } ?: error("无法读取视频文件")
+        }
         target.absolutePath
     }
 
     fun importVideoFile(role: RoleProfile, slot: DigitalHumanSlot, source: File): Result<String> = runCatching {
-        val targetDir = File(context.filesDir, "roles/${safe(role.id)}/digital-human").apply { mkdirs() }
-        val target = File(targetDir, "${slot.wireName}.mp4")
-        source.inputStream().use { input -> target.outputStream().use { output -> input.copyTo(output) } }
-        validate(target).getOrThrow()
+        val target = targetFor(role, slot)
+        replaceAtomically(target) { temp ->
+            source.inputStream().use { input -> copyWithLimit(input, temp) }
+        }
         target.absolutePath
+    }
+
+    private fun targetFor(role: RoleProfile, slot: DigitalHumanSlot): File {
+        val targetDir = File(context.filesDir, "roles/${safe(role.id)}/digital-human").apply { mkdirs() }
+        return File(targetDir, "${slot.wireName}.mp4")
+    }
+
+    /**
+     * 把 [write] 写进临时文件，**校验通过之后**才原子替换 [target]。
+     *
+     * 为什么不能直接往 target 写：`target.outputStream()` 会立刻把正式文件**截断**，
+     * 之后只要复制中途出问题（选到损坏视频、磁盘满、读取异常）或者 `validate()` 不通过，
+     * 返回的虽然是"失败"——但用户**原来那份能用的素材已经被毁了**，而且配置里还指向它。
+     *
+     * 换成"临时文件 → 校验 → 原子改名"之后，任何失败路径都只影响临时文件，
+     * 正式素材在成功之前一个字节都不会被动。临时文件放在同一目录，
+     * 保证 `ATOMIC_MOVE` 生效（跨文件系统的 move 不是原子的）。
+     */
+    private fun replaceAtomically(target: File, write: (File) -> Unit) {
+        val temp = File(target.parentFile, "${target.name}.tmp-${System.nanoTime()}")
+        try {
+            write(temp)
+            validate(temp).getOrThrow()
+            try {
+                java.nio.file.Files.move(
+                    temp.toPath(),
+                    target.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                // 极少数文件系统不支持原子改名，退化成"先删再改"。
+                // 这一步仍可能留下空档，但同一目录下几乎不会走到这里。
+                target.delete()
+                if (!temp.renameTo(target)) error("替换素材文件失败")
+            }
+        } catch (t: Throwable) {
+            temp.delete()
+            throw t
+        }
+    }
+
+    /**
+     * 带字节上限的复制。
+     *
+     * `validate()` 里也有 100 MB 的检查，但那是在**复制完之后**才做的——
+     * 选到一个几 GB 的文件会先把磁盘写满才发现。这里边拷边拦。
+     */
+    private fun copyWithLimit(input: java.io.InputStream, target: File) {
+        target.outputStream().use { output ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            var total = 0L
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                total += count
+                if (total > MAX_VIDEO_BYTES) error("视频文件不能超过 100 MB")
+                output.write(buffer, 0, count)
+            }
+        }
     }
 
     fun validate(path: String): Result<DigitalHumanVideoInfo> = validate(File(path))

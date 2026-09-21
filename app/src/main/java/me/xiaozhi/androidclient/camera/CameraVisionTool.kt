@@ -157,12 +157,21 @@ class CameraVisionTool(
         val handler = Handler(thread.looper)
         val reader = ImageReader.newInstance(1280, 720, ImageFormat.JPEG, 2)
         val finished = AtomicBoolean(false)
-        var device: CameraDevice? = null
-        var session: CameraCaptureSession? = null
+        // 这两个句柄跨线程读写：`onOpened` / `onDisconnected` / `onError` 在 HandlerThread
+        // 的回调线程上写，而 `closeResources()` 还会在**取消该协程的线程**上执行
+        // （`invokeOnCancellation` 不在回调线程上跑）。
+        //
+        // 它们是被闭包捕获的**局部变量**，Kotlin 会编译成引用对象，所以加不了 @Volatile；
+        // 而普通读写在 Android 内存模型下不保证跨线程可见 —— 那会让
+        // `if (device == null) device = disconnectedDevice` 白写，
+        // 本该被关掉的相机设备仍被 closeResources() 跳过，正是要修的那个句柄泄漏。
+        // 用 AtomicReference 一次解决两件事：可见性，以及"读-判-写"的原子性。
+        val device = java.util.concurrent.atomic.AtomicReference<CameraDevice?>(null)
+        val session = java.util.concurrent.atomic.AtomicReference<CameraCaptureSession?>(null)
 
         fun closeResources() {
-            runCatching { session?.close() }
-            runCatching { device?.close() }
+            runCatching { session.get()?.close() }
+            runCatching { device.get()?.close() }
             runCatching { reader.close() }
             thread.quitSafely()
         }
@@ -206,63 +215,78 @@ class CameraVisionTool(
             cameraManager.openCamera(cameraId, object : CameraDevice.StateCallback() {
                 override fun onOpened(openedDevice: CameraDevice) {
                     if (finished.get()) {
-                        openedDevice.close()
+                        runCatching { openedDevice.close() }
                         return
                     }
-                    device = openedDevice
-                    openedDevice.createCaptureSession(
-                        listOf(reader.surface),
-                        object : CameraCaptureSession.StateCallback() {
-                            override fun onConfigured(captureSession: CameraCaptureSession) {
-                                if (finished.get()) {
-                                    captureSession.close()
-                                    return
-                                }
-                                session = captureSession
-                                try {
-                                    val request = openedDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
-                                        .apply {
-                                            addTarget(reader.surface)
-                                            set(CaptureRequest.JPEG_ORIENTATION, CAMERA_JPEG_ORIENTATION)
-                                        }
-                                        .build()
-                                    captureSession.capture(
-                                        request,
-                                        object : CameraCaptureSession.CaptureCallback() {
-                                            override fun onCaptureFailed(
-                                                session: CameraCaptureSession,
-                                                request: CaptureRequest,
-                                                failure: CaptureFailure,
-                                            ) {
-                                                complete(Result.failure(IOException("Camera capture failed: ${failure.reason}")))
+                    device.set(openedDevice)
+                    // 这里整个包 try：`createCaptureSession` 会抛 CameraAccessException /
+                    // IllegalStateException（例如 USB 摄像头在打开后、建会话前掉线，
+                    // 或 HAL 拒绝会话配置）。此刻代码已经跑在 HandlerThread 的回调里，
+                    // 异常逃出去**没有任何人接**，会被线程的默认异常处理器抓住并
+                    // **直接结束整个应用进程**。注意外层那个 try 只包住了
+                    // `openCamera()` 调用本身，捕不到这个稍后才执行的回调。
+                    try {
+                        openedDevice.createCaptureSession(
+                            listOf(reader.surface),
+                            object : CameraCaptureSession.StateCallback() {
+                                override fun onConfigured(captureSession: CameraCaptureSession) {
+                                    if (finished.get()) {
+                                        runCatching { captureSession.close() }
+                                        return
+                                    }
+                                    session.set(captureSession)
+                                    try {
+                                        val request = openedDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                                            .apply {
+                                                addTarget(reader.surface)
+                                                set(CaptureRequest.JPEG_ORIENTATION, CAMERA_JPEG_ORIENTATION)
                                             }
+                                            .build()
+                                        captureSession.capture(
+                                            request,
+                                            object : CameraCaptureSession.CaptureCallback() {
+                                                override fun onCaptureFailed(
+                                                    session: CameraCaptureSession,
+                                                    request: CaptureRequest,
+                                                    failure: CaptureFailure,
+                                                ) {
+                                                    complete(Result.failure(IOException("Camera capture failed: ${failure.reason}")))
+                                                }
 
-                                            override fun onCaptureCompleted(
-                                                session: CameraCaptureSession,
-                                                request: CaptureRequest,
-                                                result: TotalCaptureResult,
-                                            ) = Unit
-                                        },
-                                        handler,
-                                    )
-                                } catch (error: Exception) {
-                                    complete(Result.failure(error))
+                                                override fun onCaptureCompleted(
+                                                    session: CameraCaptureSession,
+                                                    request: CaptureRequest,
+                                                    result: TotalCaptureResult,
+                                                ) = Unit
+                                            },
+                                            handler,
+                                        )
+                                    } catch (error: Exception) {
+                                        complete(Result.failure(error))
+                                    }
                                 }
-                            }
 
-                            override fun onConfigureFailed(captureSession: CameraCaptureSession) {
-                                complete(Result.failure(IOException("Camera capture session configuration failed")))
-                            }
-                        },
-                        handler,
-                    )
+                                override fun onConfigureFailed(captureSession: CameraCaptureSession) {
+                                    complete(Result.failure(IOException("Camera capture session configuration failed")))
+                                }
+                            },
+                            handler,
+                        )
+                    } catch (error: Exception) {
+                        complete(Result.failure(error))
+                    }
                 }
 
                 override fun onDisconnected(disconnectedDevice: CameraDevice) {
+                    // 走到这里说明设备掉线或出错。若 `onOpened` 从没执行过，
+                    // closeResources() 里的 device 还是 null，**回调传进来的这个设备
+                    // 就没人关了**，会一直占着相机句柄。先把它记下来再收尾。
+                    device.compareAndSet(null, disconnectedDevice)
                     complete(Result.failure(IOException("Camera was disconnected")))
                 }
 
                 override fun onError(errorDevice: CameraDevice, error: Int) {
+                    device.compareAndSet(null, errorDevice)
                     complete(Result.failure(IOException("Camera failed to open: $error")))
                 }
             }, handler)

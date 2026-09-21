@@ -12,17 +12,21 @@ import java.util.Date
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import me.xiaozhi.androidclient.audio.XiaozhiAudioEngine
 import me.xiaozhi.androidclient.camera.CameraVisionTool
 import me.xiaozhi.androidclient.data.AppPreferences
 import me.xiaozhi.androidclient.data.RoleProfileRepository
 import me.xiaozhi.androidclient.data.StoredConfig
+import me.xiaozhi.androidclient.util.ImageSampling
 import me.xiaozhi.androidclient.integration.TermuxCommandEvents
 import me.xiaozhi.androidclient.integration.TermuxCommandResult
 import me.xiaozhi.androidclient.integration.TermuxRunner
@@ -86,6 +90,36 @@ private const val TIMER_CODE_PHRASE = "【定时提醒】"
 private const val SUPERVISION_START_CODE_PHRASE = "【监督提醒】"
 private const val SUPERVISION_RESULT_CODE_PHRASE = "【监督结果】"
 
+/**
+ * 监督提醒播报完之后，隔多久调摄像头核验。
+ * 要给用户留出实际去做那件事的时间（比如"做十个深蹲"）。
+ */
+private const val SUPERVISION_VERIFY_DELAY_SECONDS = 60
+
+/**
+ * 一个监督任务最多核验几次。
+ *
+ * **必须设上限**：`nextSupervisionRetrySeconds()` 只把重试间隔封顶在 30 分钟，
+ * 不限制次数。而核验"未完成/无法确认"会一直重排，于是任务失败时会**每 30 分钟
+ * 调一次摄像头、永远不停**，既扰民又耗电。超过这个次数就停止跟踪并明确告诉用户。
+ */
+private const val MAX_SUPERVISION_CHECKS = 5
+
+/**
+ * 立绘落盘时的长边上限。
+ *
+ * 屏幕只有 800×1280，2048 已经比屏幕长边宽出 60%，按 Crop 铺满绰绰有余；
+ * 再大只是白占磁盘和解码时间。2026-09-21 实测：不设上限时一张手机照片
+ * 会在磁盘上落下 14.85 MB。
+ */
+private const val PORTRAIT_MAX_LONG_SIDE = 2048
+
+/** 头像落盘时的长边上限。头像在列表里只显示成一个小圆圈，512 足够。 */
+private const val AVATAR_MAX_LONG_SIDE = 512
+
+/** 压缩落盘时 JPEG 的质量。90 在照片上看不出损失，体积约为无损的十分之一。 */
+private const val IMAGE_JPEG_QUALITY = 90
+
 private data class ScheduledPrompt(
     val reminderId: String,
     val reminderKind: ReminderKind,
@@ -125,11 +159,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var goodbyeDisconnectWindowJob: Job? = null
     private var scheduledDeliveryJob: Job? = null
     private var supervisionVerificationJob: Job? = null
+
+    /**
+     * 串行化监督核验：同一时刻只允许一次摄像头核验在跑。
+     *
+     * 用 Mutex 而不是"忙就丢弃"的守卫，是因为丢弃会让任务永久卡死（见
+     * [startSupervisionVerification] 的注释）。排队等待的一方在拿到锁之后
+     * 还会再确认一次任务身份，所以等待期间任务被取消也不会拍到错的照片。
+     */
+    private val supervisionVerificationMutex = kotlinx.coroutines.sync.Mutex()
     private var userRequestedDisconnect: Boolean = false
     private var conversationLoopActive: Boolean = false
     private var scheduledResumeCancelledByUser: Boolean = false
     private var ignoreLifecycleGoodbyeAfterScheduledDelivery: Boolean = false
     private var appUpdateCheckJob: Job? = null
+
+    /**
+     * 上一次读取附加角色是否**失败**（区别于"确实没有附加角色"）。
+     *
+     * 置位期间 [saveAdditionalProfiles] 会拒绝一切全量写入——因为此时内存里的角色列表
+     * 并不代表磁盘上的真实内容，写回去就等于用残缺快照覆盖用户配置。
+     * 一次成功的读取会自动把它清掉。
+     */
+    private var additionalProfilesLoadFailed: Boolean = false
+
     private val pendingTextPrompts = ArrayDeque<String>()
 
     /**
@@ -238,33 +291,40 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     fun importRoleAvatar(roleId: String, uri: Uri) {
         val role = roleProfiles.firstOrNull { it.id == roleId } ?: return
-        runCatching {
-            val avatarDir = File(getApplication<Application>().filesDir, "avatar").apply { mkdirs() }
-            val targetFile = File(avatarDir, "role-${role.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}")
-            val resolver = getApplication<Application>().contentResolver
-            resolver.openInputStream(uri)?.use { input ->
-                targetFile.outputStream().use { output -> input.copyTo(output) }
-            } ?: error("无法读取所选图片")
-            targetFile.absolutePath
-        }.onSuccess { path ->
-            if (role.id == RoleProfileRepository.DEFAULT_ROLE_ID) {
-                updateAndPersist {
-                    copy(
-                        assistantAvatarPath = path,
-                        activeRoleAvatarPath = if (activeRoleId == role.id) path else activeRoleAvatarPath,
+        val app = getApplication<Application>()
+        // 与立绘同理：复制 + 校验走 IO 线程，配置写入回主线程。
+        viewModelScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching {
+                    val avatarDir = File(app.filesDir, "avatar").apply { mkdirs() }
+                    val targetFile = File(avatarDir, "role-${role.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}")
+                    replaceImageAtomically(targetFile, AVATAR_MAX_LONG_SIDE) { temp ->
+                        app.contentResolver.openInputStream(uri)?.use { input ->
+                            temp.outputStream().use { output -> input.copyTo(output) }
+                        } ?: error("无法读取所选图片")
+                    }
+                }
+            }
+            outcome.onSuccess { path ->
+                if (role.id == RoleProfileRepository.DEFAULT_ROLE_ID) {
+                    updateAndPersist {
+                        copy(
+                            assistantAvatarPath = path,
+                            activeRoleAvatarPath = if (activeRoleId == role.id) path else activeRoleAvatarPath,
+                        )
+                    }
+                } else {
+                    saveAdditionalProfiles(
+                        roleProfiles.filterNot(::isPrimaryRole).map { profile ->
+                            if (profile.id == role.id) profile.copy(avatarPath = path) else profile
+                        },
                     )
                 }
-            } else {
-                saveAdditionalProfiles(
-                    roleProfiles.filterNot(::isPrimaryRole).map { profile ->
-                        if (profile.id == role.id) profile.copy(avatarPath = path) else profile
-                    },
-                )
+                reloadRoleProfiles()
+                addLog("已更新${role.displayName}头像")
+            }.onFailure { error ->
+                addLog("更新头像失败：${error.message.orEmpty()}")
             }
-            reloadRoleProfiles()
-            addLog("已更新${role.displayName}头像")
-        }.onFailure { error ->
-            addLog("更新头像失败：${error.message.orEmpty()}")
         }
     }
 
@@ -274,24 +334,28 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      */
     fun importRolePortrait(roleId: String, uri: Uri) {
         val role = roleProfiles.firstOrNull { it.id == roleId } ?: return
-        runCatching {
-            val dir = File(getApplication<Application>().filesDir, "portraits").apply { mkdirs() }
-            val target = File(dir, "role-${role.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}.jpg")
-            val resolver = getApplication<Application>().contentResolver
-            resolver.openInputStream(uri)?.use { input ->
-                target.outputStream().use { output -> input.copyTo(output) }
-            } ?: error("无法读取所选图片")
-            // 确认真的是一张能解码的图片，避免把坏文件写进配置
-            require(android.graphics.BitmapFactory.decodeFile(target.absolutePath) != null) {
-                "所选文件不是可识别的图片"
+        val app = getApplication<Application>()
+        // 复制 + 校验都放 IO 线程。用户选的可能是十几 MB 的原图，
+        // 在主线程做这些 I/O 会和界面抢时间（实测导入 14.85 MB 的图时，
+        // 触摸响应、WebSocket 重连、音频采集全部停摆）。
+        viewModelScope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching {
+                    val target = portraitFileFor(role.id).apply { parentFile?.mkdirs() }
+                    replaceImageAtomically(target, PORTRAIT_MAX_LONG_SIDE) { temp ->
+                        app.contentResolver.openInputStream(uri)?.use { input ->
+                            temp.outputStream().use { output -> input.copyTo(output) }
+                        } ?: error("无法读取所选图片")
+                    }
+                }
             }
-            target.absolutePath
-        }.onSuccess { path ->
-            applyPortraitPath(role, path)
-            reloadRoleProfiles()
-            addLog("已更新${role.displayName}立绘")
-        }.onFailure { error ->
-            addLog("更新立绘失败：${error.message.orEmpty()}")
+            outcome.onSuccess { path ->
+                applyPortraitPath(role, path)
+                reloadRoleProfiles()
+                addLog("已更新${role.displayName}立绘")
+            }.onFailure { error ->
+                addLog("更新立绘失败：${error.message.orEmpty()}")
+            }
         }
     }
 
@@ -299,18 +363,148 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun importRolePortraitFromFile(roleId: String, source: File): String {
         val role = roleProfiles.firstOrNull { it.id == roleId } ?: return "角色不存在：$roleId"
         return runCatching {
-            val dir = File(getApplication<Application>().filesDir, "portraits").apply { mkdirs() }
-            val target = File(dir, "role-${role.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}.jpg")
-            source.inputStream().use { input -> target.outputStream().use { output -> input.copyTo(output) } }
-            require(android.graphics.BitmapFactory.decodeFile(target.absolutePath) != null) {
-                "所选文件不是可识别的图片"
+            val target = portraitFileFor(role.id).apply { parentFile?.mkdirs() }
+            replaceImageAtomically(target, PORTRAIT_MAX_LONG_SIDE) { temp ->
+                source.inputStream().use { input -> temp.outputStream().use { output -> input.copyTo(output) } }
             }
-            target.absolutePath
         }.map { path ->
             applyPortraitPath(role, path)
             reloadRoleProfiles()
             "已更新${role.displayName}立绘"
         }.getOrElse { "导入立绘失败：${it.message}" }
+    }
+
+    /**
+     * 把图片写进临时文件、**校验通过后**再原子替换正式文件，返回正式文件路径。
+     *
+     * 为什么不能直接往目标文件写：`target.outputStream()` 会先把正式文件**截断**，
+     * 之后只要复制中途出问题（选到损坏图片、磁盘满、读取异常）或者根本不是图片，
+     * 返回的虽然是"失败"——但用户**原来那张能用的图已经被毁了**，
+     * 而且配置里还指向那个坏文件。换素材反而把素材弄丢，是最不能接受的一类 bug。
+     *
+     * 顺带把头像也纳入"必须是能解码的图片"这条校验：之前头像入口完全没有校验，
+     * 任何文件都能被写进去并写进配置。
+     */
+    private fun replaceImageAtomically(target: File, maxLongSide: Int, write: (File) -> Unit): String {
+        val temp = File(target.parentFile, "${target.name}.tmp-${System.nanoTime()}")
+        try {
+            write(temp)
+            require(isDecodableImage(temp)) { "所选文件不是可识别的图片" }
+            // 压缩落盘。**失败就算了**：宁可原样存着，也绝不能因为"顺手优化"把用户的图弄丢 ——
+            // 所以只 runCatching，任何异常都不影响后面把它原子换上。
+            runCatching { shrinkImageIfNeeded(temp, maxLongSide) }
+            try {
+                java.nio.file.Files.move(
+                    temp.toPath(),
+                    target.toPath(),
+                    java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+                    java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                )
+            } catch (_: java.nio.file.AtomicMoveNotSupportedException) {
+                target.delete()
+                if (!temp.renameTo(target)) error("替换图片文件失败")
+            }
+            return target.absolutePath
+        } catch (t: Throwable) {
+            temp.delete()
+            throw t
+        }
+    }
+
+    /**
+     * 判断文件是不是一张真的能解码的图片。
+     *
+     * **绝对不能用 `BitmapFactory.decodeFile(path)` 来判**——那是按**原始分辨率**解码，
+     * 位图字节数 = 宽 × 高 × 4。2026-09-19 真机实测：导入一张 18540×23437 的 JPEG，
+     * 需要一次性分配 **1.74 GB**，而这块 RK3568 板子 `MemTotal` 只有 **1.92 GB**。
+     * 后果是整机被打进 zram 换页（`SwapFree` 掉 304 MB、10170 次 major 缺页、
+     * `kswapd0` 占 26% CPU），主线程卡死 **5.1 秒**触发 ANR——
+     * 一次"导入立绘"就能让整台设备瘫痪几秒。
+     *
+     * 改成两步之后，内存占用与图片原始大小**完全脱钩**：
+     *   1. `inJustDecodeBounds` 只读文件头，拿不到宽高就说明根本不是图片；
+     *   2. 再用一个足够大的 `inSampleSize` 真解一次，确认像素数据没坏
+     *      （只看文件头的话，被截断的图会漏过去），此时位图已被压到几百像素见方。
+     */
+    private fun isDecodableImage(file: File): Boolean {
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
+        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) return false
+
+        // 采样率由 util/ImageSampling 统一给出（纯函数、有单元测试），
+        // 不再在这里内联一份 —— 两处各写一份算术，迟早会走偏。
+        val options = android.graphics.BitmapFactory.Options().apply {
+            inSampleSize = ImageSampling.probeSampleSize(bounds.outWidth, bounds.outHeight)
+        }
+        val decoded = runCatching {
+            android.graphics.BitmapFactory.decodeFile(file.absolutePath, options)
+        }.getOrNull() ?: return false
+        // recycle 放进 finally：紧跟 `?: return` 之后写的话，协程若在这个窗口被取消
+        // （用户在导入大图途中返回/切角色 → onCleared 取消 viewModelScope），
+        // 控制流会在下一个挂起点抛 CancellationException，recycle 被跳过，
+        // 位图只能等 GC —— 而在 1.92 GB 的板子上"等 GC"正是这次要避免的事。
+        return try {
+            true
+        } finally {
+            decoded.recycle()
+        }
+    }
+
+    /**
+     * 图片过大时**原地**等比缩到长边不超过 [maxLongSide]。
+     *
+     * 为什么值得做：立绘是**原图直存**的。2026-09-21 真机实测，用户从手机导入一张
+     * 4000×6000 的照片，磁盘上就落下 **14.85 MB**——而屏幕只有 800×1280，
+     * 多出来的像素只带来解码开销和存储占用。这块板子存储和内存都紧。
+     *
+     * 三条安全约束：
+     *  1. **本来就不大就一个字节都不动**（不重编码，避免无谓的画质损失）；
+     *  2. 用 [ImageSampling.fitSampleSize] 先粗采样再精确缩放，
+     *     避免"为了存缩略图反而按原尺寸解码"；
+     *  3. 有 alpha 通道时存 PNG，否则存 JPEG —— 头像可能是带透明的图，
+     *     一律转 JPEG 会把透明区域变黑。
+     *
+     * 调用方用 `runCatching` 包着：**这里失败就保留原图**，绝不因此弄丢用户的素材。
+     */
+    private fun shrinkImageIfNeeded(file: File, maxLongSide: Int) {
+        if (maxLongSide <= 0) return
+        val bounds = android.graphics.BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        android.graphics.BitmapFactory.decodeFile(file.absolutePath, bounds)
+        val width = bounds.outWidth
+        val height = bounds.outHeight
+        if (width <= 0 || height <= 0) return
+        if (maxOf(width, height) <= maxLongSide) return
+
+        val sample = ImageSampling.fitSampleSize(width, height, maxLongSide)
+        val decoded = android.graphics.BitmapFactory.decodeFile(
+            file.absolutePath,
+            android.graphics.BitmapFactory.Options().apply { inSampleSize = sample },
+        ) ?: return
+
+        val longSide = maxOf(decoded.width, decoded.height)
+        val scaled = if (longSide > maxLongSide) {
+            val ratio = maxLongSide.toFloat() / longSide
+            android.graphics.Bitmap.createScaledBitmap(
+                decoded,
+                (decoded.width * ratio).toInt().coerceAtLeast(1),
+                (decoded.height * ratio).toInt().coerceAtLeast(1),
+                true,
+            )
+        } else {
+            decoded
+        }
+
+        try {
+            val format = if (scaled.hasAlpha()) {
+                android.graphics.Bitmap.CompressFormat.PNG
+            } else {
+                android.graphics.Bitmap.CompressFormat.JPEG
+            }
+            file.outputStream().use { out -> scaled.compress(format, IMAGE_JPEG_QUALITY, out) }
+        } finally {
+            if (scaled !== decoded) scaled.recycle()
+            decoded.recycle()
+        }
     }
 
     fun clearRolePortrait(roleId: String) {
@@ -457,6 +651,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             appUpdateCheckJob?.cancel()
         }
         appUpdateCheckJob = viewModelScope.launch {
+            // 记住"我是哪个 Job"。下面的 finally 必须靠它判断自己是不是**当前**那一个。
+            val self = kotlinx.coroutines.currentCoroutineContext()[kotlinx.coroutines.Job]
             if (!silent) {
                 _uiState.update { it.copy(isCheckingUpdate = true, updateCheckStatus = "正在检查更新...") }
             }
@@ -481,8 +677,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 }
             } finally {
-                _uiState.update { it.copy(isCheckingUpdate = false) }
-                appUpdateCheckJob = null
+                // **只有自己还是"当前那次检查"时才清状态。**
+                //
+                // 手动点击会 cancel 掉在跑的静默检查再起一个新的。而 cancel() 是异步的：
+                // 旧任务稍后才会走到这里，此时 appUpdateCheckJob 已经指向**新**任务了。
+                // 如果这里无条件清空，就会把新任务的忙状态和 Job 引用一起抹掉——
+                // 界面提前结束"检查中"，之后也识别不到正在跑的检查。这是 v1.2.5 引入的回归。
+                if (appUpdateCheckJob === self) {
+                    _uiState.update { it.copy(isCheckingUpdate = false) }
+                    appUpdateCheckJob = null
+                }
             }
         }
     }
@@ -559,7 +763,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
         saveAdditionalProfiles(roleProfiles.filterNot(::isPrimaryRole) + role)
         reloadRoleProfiles()
-        selectRole(role.id)
+        // **不再自动切到新角色。**
+        //
+        // 切角色会把本地聊天记录即时清空（见项目的角色与唤醒规则），
+        // 所以"自动切换"等于「用户只是新建了一个角色，没点任何东西，聊天记录就没了」——
+        // 这是一个有数据后果的动作，不该无提示地发生。
+        // 2026-09-21 真机实测（用户模拟测试）：新建角色后当前角色被静默换掉、
+        // 聊天记录被清空，测试者原话是"用户没被告知"。
+        //
+        // 现在改为：新角色安静地出现在列表里，用户点它才切过去（那是一次显式操作）。
+        addLog("已新增角色：$name（点它即可切换过去）")
     }
 
     /**
@@ -619,6 +832,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun deleteRole(roleId: String) {
         if (roleId == RoleProfileRepository.DEFAULT_ROLE_ID) {
             val avatarPath = uiState.value.assistantAvatarPath
+            val portraitPath = uiState.value.assistantPortraitPath
             userRequestedDisconnect = true
             cancelReconnect()
             realtimeClient.disconnect(notify = false)
@@ -639,19 +853,33 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
             digitalHumanAssets.deleteRoleAssets(roleId)
             deleteFileIfOwned(avatarPath)
-            roleProfiles = emptyList()
+            deleteFileIfOwned(portraitPath)
+            deleteFileIfOwned(portraitFileFor(roleId).absolutePath)
+            // **必须从磁盘重新读一遍，不能只把内存清空。**
+            // roles.json 里还有附加角色，内存清空之后只要用户新增一个角色，
+            // 就会拿「空列表 + 新角色」去全量覆盖 roles.json，
+            // 把磁盘上其余角色的绑定信息和素材路径一起抹掉。
+            reloadRoleProfiles()
             addLog("已删除角色：小智")
             userRequestedDisconnect = false
+            // 还有附加角色就切过去，别把界面停在"一个角色都没有"的状态。
+            roleProfiles.firstOrNull()?.let { selectRole(it.id) }
             return
         }
         val removedRole = roleProfiles.firstOrNull { it.id == roleId }
-        saveAdditionalProfiles(roleProfiles.filterNot { it.id == roleId })
-        removedRole?.let {
-            digitalHumanAssets.deleteRoleAssets(it.id)
-            deleteFileIfOwned(it.avatarPath)
-        }
+        val remaining = roleProfiles.filterNot { it.id == roleId }
+        // 统一排除主角色：其他调用点都传 filterNot(::isPrimaryRole)，
+        // 只有这里传过全量列表，会把主角色也写进 roles.json（加载时被过滤掉，
+        // 所以没暴露出来，但属于脏数据）。
+        saveAdditionalProfiles(remaining.filterNot(::isPrimaryRole))
+        // 内存列表**当场同步**。否则删除之后、reloadRoleProfiles() 之前，
+        // 只要这个角色的绑定回调（updateRoleBindingStatus）回来，它就会遍历
+        // 这份还带着已删角色的旧列表并保存——把刚删掉的角色又写回磁盘，
+        // 而它的素材其实已经删了，变成一个指向空文件的幽灵角色。
+        roleProfiles = remaining
+        removedRole?.let { deleteRoleFiles(it) }
         if (activeRoleId == roleId) {
-            val next = roleProfiles.firstOrNull { it.id != roleId }
+            val next = remaining.firstOrNull { it.id != roleId }
             if (next != null) selectRole(next.id) else {
                 activeRoleId = ""
                 updateAndPersist { copy(activeRoleId = "", activeRoleName = "", roleProfiles = emptyList()) }
@@ -965,7 +1193,27 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         )
         val result = roleProfileRepository.loadAdditionalProfiles()
         val hasPrimary = primaryProfile.displayName.isNotBlank() && primaryProfile.wakeWords.isNotEmpty() && primaryProfile.deviceId.isNotBlank()
-        roleProfiles = (if (hasPrimary) listOf(primaryProfile) else emptyList()) + result.profiles.filter { it.id != primaryProfile.id }
+
+        // 读取**失败**和读取到**空**是两回事，绝不能混为一谈。
+        //
+        // `loadAdditionalProfiles()` 在 roles.json 损坏或读不出来时会返回空列表 + warning。
+        // 旧代码把这个失败直接当成"没有附加角色"，用空列表替换了内存里的角色列表；
+        // 之后用户只要新增一个角色，就会拿"空列表 + 新角色"去**全量覆盖** roles.json，
+        // 把磁盘上原本好好的角色配置全部抹掉——和之前那次「用户素材被清空」是同一类事故。
+        //
+        // 现在的处理：读取失败时**保留上一次已知有效的内存快照**，并置位
+        // `additionalProfilesLoadFailed` 冻结写入，直到某次读取成功才解冻。
+        additionalProfilesLoadFailed = result.warning != null
+        if (additionalProfilesLoadFailed) {
+            addLog("附加角色读取失败，已保留上次快照并冻结角色配置写入：${result.warning}")
+        }
+        val additionalProfiles = if (additionalProfilesLoadFailed) {
+            roleProfiles.filterNot(::isPrimaryRole)
+        } else {
+            result.profiles.filter { it.id != primaryProfile.id }
+        }
+
+        roleProfiles = (if (hasPrimary) listOf(primaryProfile) else emptyList()) + additionalProfiles
         if (roleProfiles.none { it.id == activeRoleId }) {
             activeRoleId = roleProfiles.firstOrNull()?.id.orEmpty()
         }
@@ -1015,6 +1263,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         profile.id == RoleProfileRepository.DEFAULT_ROLE_ID
 
     private fun saveAdditionalProfiles(profiles: List<RoleProfile>) {
+        // 冻结闸门：上一次读取失败时，内存里的列表并不代表磁盘上的真实内容，
+        // 这时做全量写入等于**用残缺的快照覆盖用户的配置**。
+        // 宁可这一次改动不生效（并明确告诉用户），也不能把数据写没了。
+        if (additionalProfilesLoadFailed) {
+            addLog("角色配置此前读取失败，为避免覆盖磁盘上的原有配置，本次写入已被拒绝。请重启应用后再试。")
+            return
+        }
         roleProfileRepository.saveAdditionalProfiles(profiles)
     }
 
@@ -1456,6 +1711,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun handleScheduledReminderDue(reminder: ScheduledReminder) {
+        // 监督任务的"到点"有**两种完全不同的含义**，必须分开处理：
+        //   COUNTDOWN → WAITING_FOR_ACK：该提醒用户了，发【监督】让模型开口提醒；
+        //   VERIFICATION_SCHEDULED → VERIFYING：该核实做没做了，**直接调摄像头**。
+        //
+        // 旧代码不区分阶段，核验到点又发一遍【监督】文本，于是摄像头核验永远不会发生
+        // ——`startSupervisionVerification()` 写得很完整却成了一个没有调用点的死函数。
+        if (reminder.kind == ReminderKind.SUPERVISION &&
+            reminder.supervisionPhase == SupervisionPhase.VERIFYING
+        ) {
+            startSupervisionVerification(reminder)
+            return
+        }
         val text = when {
             reminder.kind == ReminderKind.SUPERVISION ->
                 "【监督】"
@@ -1504,57 +1771,124 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startSupervisionVerification(reminder: ScheduledReminder) {
-        if (supervisionVerificationJob?.isActive == true) {
-            addLog("监督核验已经在执行，忽略重复触发：${reminder.message}")
-            return
-        }
         val current = reminderScheduler.activeSupervision()
         if (current?.id != reminder.id || current.supervisionPhase != SupervisionPhase.VERIFYING) {
             addLog("忽略已失效的监督核验：${reminder.message}")
             return
         }
+        // 这里曾经是「已经在执行就 return」的**丢弃式**守卫，会造成任务永久卡死：
+        // `ReminderScheduler.tick()` 会**一次性**把所有到期任务推进到 VERIFYING 并清空
+        // dueAtEpochMs，然后才逐个回调 onDue；而 `viewModelScope.launch` 立即返回一个
+        // 活跃 Job。于是第二个到期任务被守卫丢弃，而它既不会再到期、也没有任何重排路径
+        // （重排只发生在 retryOrGiveUpSupervision 里，那要拿到摄像头结果才会被调用），
+        // 结果是**永久停在「正在拍照核验」**。
+        // 设备重启后 `ReminderScheduler.start()` 会把所有 VERIFYING 归一成"立即到期"，
+        // 所以"两条以上监督任务同时到期"完全可达，第二条必然被丢弃。
+        // （这条守卫是旧代码，但在此之前 startSupervisionVerification 是死代码、
+        //   永远不会被调用；是 v1.2.6 把这个函数接通，才让潜伏缺陷变成活的。）
+        // 现在改成 Mutex 排队：后来的等前面的跑完再跑，一次都不丢。
         supervisionVerificationJob = viewModelScope.launch {
-            addLog("监督核验到点，设备开始调用摄像头：${reminder.message}")
-            val result = runCatching {
-                cameraVisionTool.takePhotoAndExplain(supervisionVisionQuestion(reminder.message))
-            }
-            val status = result.getOrNull()
-                ?.let(SupervisionVisionDecisionParser::parse)
-                ?.status
-                ?: SupervisionVisionStatus.UNCERTAIN
-            result.getOrNull()?.let { response ->
-                addLog("监督视觉返回：${response.replace('\n', ' ').take(160)}")
-            }
-            if (reminderScheduler.activeSupervision()?.id != reminder.id) {
-                addLog("监督任务已变化，丢弃本次摄像头结果")
-                supervisionVerificationJob = null
-                return@launch
-            }
-
-            val promptText = when (status) {
-                SupervisionVisionStatus.COMPLETED -> {
-                    reminderScheduler.completeSupervision(reminder.id)
-                    addLog("摄像头已确认监督任务完成：${reminder.message}")
-                    // listen/detect is a wake-word channel; full task text is rejected as long text.
-                    "${SUPERVISION_RESULT_CODE_PHRASE}已完成"
-                }
-                SupervisionVisionStatus.NOT_COMPLETED -> {
-                    val retrySeconds = nextSupervisionRetrySeconds(reminder.checkCount)
-                    reminderScheduler.scheduleSupervisionVerification(reminder.id, retrySeconds)
-                    addLog("摄像头确认任务尚未完成，$retrySeconds 秒后再次核验：${reminder.message}")
-                    "${SUPERVISION_RESULT_CODE_PHRASE}未完成"
-                }
-                SupervisionVisionStatus.UNCERTAIN -> {
-                    val retrySeconds = nextSupervisionRetrySeconds(reminder.checkCount)
-                    reminderScheduler.scheduleSupervisionVerification(reminder.id, retrySeconds)
-                    val reason = result.exceptionOrNull()?.message.orEmpty()
-                    addLog("摄像头无法确认任务，$retrySeconds 秒后重试${reason.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty()}")
-                    "${SUPERVISION_RESULT_CODE_PHRASE}无法确认"
-                }
-            }
-            supervisionVerificationJob = null
-            enqueueScheduledPrompt("${reminder.id}-result-${reminder.checkCount}", ReminderKind.SUPERVISION, promptText)
+            supervisionVerificationMutex.withLock { runSupervisionVerification(reminder) }
         }
+    }
+
+    /**
+     * 真正跑一次摄像头核验。
+     *
+     * 与 [startSupervisionVerification] 分开是为了让"排队"成立：排队等待期间任务可能
+     * 已被取消或换掉，所以**进入时还要再确认一次任务身份**，不能只信排出时的相位快照。
+     */
+    private suspend fun runSupervisionVerification(reminder: ScheduledReminder) {
+        if (reminderScheduler.activeSupervision()?.id != reminder.id) {
+            addLog("排队的监督核验已失效，跳过：${reminder.message}")
+            return
+        }
+        addLog("监督核验到点，设备开始调用摄像头：${reminder.message}")
+        val result = runCatching {
+            cameraVisionTool.takePhotoAndExplain(supervisionVisionQuestion(reminder.message))
+        }
+        val status = result.getOrNull()
+            ?.let(SupervisionVisionDecisionParser::parse)
+            ?.status
+            ?: SupervisionVisionStatus.UNCERTAIN
+        result.getOrNull()?.let { response ->
+            addLog("监督视觉返回：${response.replace('\n', ' ').take(160)}")
+        }
+        if (reminderScheduler.activeSupervision()?.id != reminder.id) {
+            addLog("监督任务已变化，丢弃本次摄像头结果")
+            return
+        }
+
+        val promptText = when (status) {
+            SupervisionVisionStatus.COMPLETED -> {
+                reminderScheduler.completeSupervision(reminder.id)
+                addLog("摄像头已确认监督任务完成：${reminder.message}")
+                // listen/detect is a wake-word channel; full task text is rejected as long text.
+                "${SUPERVISION_RESULT_CODE_PHRASE}已完成"
+            }
+            SupervisionVisionStatus.NOT_COMPLETED -> {
+                if (retryOrGiveUpSupervision(reminder, "确认任务尚未完成")) {
+                    "${SUPERVISION_RESULT_CODE_PHRASE}未完成"
+                } else {
+                    "${SUPERVISION_RESULT_CODE_PHRASE}未完成，核验次数已用尽"
+                }
+            }
+            SupervisionVisionStatus.UNCERTAIN -> {
+                val reason = result.exceptionOrNull()?.message.orEmpty()
+                val detail = "无法确认" + reason.takeIf { it.isNotBlank() }?.let { "：$it" }.orEmpty()
+                if (retryOrGiveUpSupervision(reminder, detail)) {
+                    "${SUPERVISION_RESULT_CODE_PHRASE}无法确认"
+                } else {
+                    "${SUPERVISION_RESULT_CODE_PHRASE}无法确认，核验次数已用尽"
+                }
+            }
+        }
+        enqueueScheduledPrompt("${reminder.id}-result-${reminder.checkCount}", ReminderKind.SUPERVISION, promptText)
+    }
+
+    /**
+     * 监督提醒播报结束后的收尾。
+     *
+     * **播报结束不等于任务完成**——监督任务的语义是「到点提醒 → 留时间给用户去做 →
+     * 调摄像头核实」。所以这里要转入「安排核验」，而不是把任务删掉。
+     * 旧代码在播报结束时无条件 `completeSupervision()`，后果是：用户还没来得及做、
+     * 任务就已经被删了，而且摄像头核验永远不会发生。
+     */
+    private fun scheduleSupervisionVerificationAfterDelivery(reminderId: String) {
+        if (reminderScheduler.scheduleSupervisionVerification(reminderId, SUPERVISION_VERIFY_DELAY_SECONDS)) {
+            addLog("监督提醒已播报，${SUPERVISION_VERIFY_DELAY_SECONDS} 秒后调摄像头核验")
+        } else {
+            addLog("监督任务状态不允许安排核验，已跳过（可能已被取消）")
+        }
+    }
+
+    /**
+     * 核验没通过时：还能再试就排下一次，次数用尽就停止跟踪。
+     * 返回 true 表示「已安排下一次核验」。
+     *
+     * 必须设次数上限：`nextSupervisionRetrySeconds()` 只把**间隔**封顶在 30 分钟、
+     * 不限制次数，所以任务一直判定未完成时会**每 30 分钟调一次摄像头、永远不停**，
+     * 既扰民又耗电。
+     */
+    private fun retryOrGiveUpSupervision(reminder: ScheduledReminder, reason: String): Boolean {
+        if (reminder.checkCount >= MAX_SUPERVISION_CHECKS) {
+            reminderScheduler.completeSupervision(reminder.id)
+            addLog("监督任务核验 $MAX_SUPERVISION_CHECKS 次仍未完成，停止跟踪：${reminder.message}")
+            return false
+        }
+        val retrySeconds = nextSupervisionRetrySeconds(reminder.checkCount)
+        // 必须看返回值：phase 不满足 WAITING_FOR_ACK / VERIFYING 时
+        // scheduleSupervisionVerification 会返回 false（**并没有安排任何核验**）。
+        // 旧写法无条件 return true 并打"N 秒后再次核验"，于是两件事同时发生：
+        // 调用方据 true 回报给模型"稍后会再核验"（实际不会），日志也在撒谎。
+        // 相邻的 scheduleSupervisionVerificationAfterDelivery 反而正确区分了两种情况，
+        // 说明这里是遗漏而非设计。
+        if (!reminderScheduler.scheduleSupervisionVerification(reminder.id, retrySeconds)) {
+            addLog("监督任务状态已变化，无法安排再次核验：${reminder.message}")
+            return false
+        }
+        addLog("摄像头$reason，$retrySeconds 秒后再次核验：${reminder.message}")
+        return true
     }
 
     private fun supervisionVisionQuestion(message: String): String =
@@ -1940,7 +2274,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val deliveredPrompt = finishScheduledDelivery("收到 goodbye")
         when (deliveredPrompt?.reminderKind) {
             ReminderKind.TIMER -> reminderScheduler.completeTimer(deliveredPrompt.reminderId)
-            ReminderKind.SUPERVISION -> reminderScheduler.completeSupervision(deliveredPrompt.reminderId)
+            ReminderKind.SUPERVISION -> scheduleSupervisionVerificationAfterDelivery(deliveredPrompt.reminderId)
             null -> Unit
         }
         val shouldResume = (deliveredPrompt?.resumeListeningAfterDelivery == true ||
@@ -2044,7 +2378,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val deliveredPrompt = finishScheduledDelivery("提醒播报完成")
                 when (deliveredPrompt?.reminderKind) {
                     ReminderKind.TIMER -> reminderScheduler.completeTimer(deliveredPrompt.reminderId)
-                    ReminderKind.SUPERVISION -> reminderScheduler.completeSupervision(deliveredPrompt.reminderId)
+                    ReminderKind.SUPERVISION -> scheduleSupervisionVerificationAfterDelivery(deliveredPrompt.reminderId)
                     null -> Unit
                 }
                 if (deliveredPrompt?.resumeListeningAfterDelivery == true && !scheduledResumeCancelledByUser) {
@@ -2422,6 +2756,32 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         updateState {
             copy(logs = (logs + LogLine(timestamp, message)).takeLast(300))
         }
+    }
+
+    /**
+     * 一个角色立绘文件的**唯一命名规则**。
+     *
+     * 抽出来是因为它有三个使用点（导入、删除、清理），各写一份迟早会走偏——
+     * 2026-09-21 真机实测就吃过这个亏：删除角色的两条路径都清理了头像和四段视频，
+     * **唯独漏了立绘**，于是删完角色后 `portraits/role-<id>.jpg` 变成 14.85 MB 的孤儿文件，
+     * 而这块板子存储本来就紧。
+     */
+    private fun portraitFileFor(roleId: String): File {
+        val safeId = roleId.replace(Regex("[^a-zA-Z0-9._-]"), "_")
+        return File(File(getApplication<Application>().filesDir, "portraits"), "role-$safeId.jpg")
+    }
+
+    /**
+     * 删掉一个角色在磁盘上的**全部**专属素材。
+     *
+     * 除了配置里记着的那几个路径，还按角色 id 再算一遍立绘路径——
+     * 配置与磁盘不一致时（换过素材、或历史遗留）才不会留下孤儿文件。
+     */
+    private fun deleteRoleFiles(role: RoleProfile) {
+        digitalHumanAssets.deleteRoleAssets(role.id)
+        deleteFileIfOwned(role.avatarPath)
+        deleteFileIfOwned(role.portraitPath)
+        deleteFileIfOwned(portraitFileFor(role.id).absolutePath)
     }
 
     private fun deleteFileIfOwned(path: String) {
