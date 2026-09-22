@@ -356,9 +356,15 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    /** 供开发期调试接口使用：从本地文件导入立绘。 */
-    fun importRolePortraitFromFile(roleId: String, source: File): String {
-        val role = roleProfiles.firstOrNull { it.id == roleId } ?: return "角色不存在：$roleId"
+    /**
+     * 从本地文件导入立绘。扫码上传与开发期调试接口共用这条路径。
+     *
+     * 返回 `Result` 而不是消息字符串：扫码上传那条路要据此决定给用户**绿色还是红色**反馈，
+     * 靠"消息里有没有『失败』两个字"来判断太脆。
+     */
+    fun importRolePortraitFromFile(roleId: String, source: File): Result<String> {
+        val role = roleProfiles.firstOrNull { it.id == roleId }
+            ?: return Result.failure(IllegalArgumentException("角色不存在：$roleId"))
         return runCatching {
             val target = portraitFileFor(role.id).apply { parentFile?.mkdirs() }
             replaceImageAtomically(target, PORTRAIT_MAX_LONG_SIDE) { temp ->
@@ -368,7 +374,29 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             applyPortraitPath(role, path)
             reloadRoleProfiles()
             "已更新${role.displayName}立绘"
-        }.getOrElse { "导入立绘失败：${it.message}" }
+        }
+    }
+
+    /**
+     * 从本地文件导入头像。与立绘同理，供扫码上传使用。
+     *
+     * 头像和立绘走的是两套落盘目录与两个压缩上限（512 / 2048），别合并。
+     */
+    fun importRoleAvatarFromFile(roleId: String, source: File): Result<String> {
+        val role = roleProfiles.firstOrNull { it.id == roleId }
+            ?: return Result.failure(IllegalArgumentException("角色不存在：$roleId"))
+        val app = getApplication<Application>()
+        return runCatching {
+            val avatarDir = File(app.filesDir, "avatar").apply { mkdirs() }
+            val targetFile = File(avatarDir, "role-${role.id.replace(Regex("[^a-zA-Z0-9._-]"), "_")}")
+            replaceImageAtomically(targetFile, AVATAR_MAX_LONG_SIDE) { temp ->
+                source.inputStream().use { input -> temp.outputStream().use { output -> input.copyTo(output) } }
+            }
+        }.map { path ->
+            applyAvatarPath(role, path)
+            reloadRoleProfiles()
+            "已更新${role.displayName}头像"
+        }
     }
 
     /**
@@ -491,14 +519,34 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             decoded
         }
 
+        // 压到**另一个**临时文件，校验通过后再换过去。
+        //
+        // 绝不能写成 `file.outputStream()`：那会先把已经校验过的文件**截断**，
+        // 一旦 compress 中途失败（磁盘满、编码异常）或返回值是 false，
+        // 留下的就是残文件；而上层是 `runCatching { shrinkImageIfNeeded(...) }` 吞异常，
+        // 随后照样把它 move 到正式路径 —— **用户原来那张能用的图被毁掉，HTTP 还回成功**。
+        // 这个坑是代码评审指出来的，实测路径确认成立。
+        val shrunk = File(file.parentFile, "${file.name}.shrunk-${System.nanoTime()}")
         try {
             val format = if (scaled.hasAlpha()) {
                 android.graphics.Bitmap.CompressFormat.PNG
             } else {
                 android.graphics.Bitmap.CompressFormat.JPEG
             }
-            file.outputStream().use { out -> scaled.compress(format, IMAGE_JPEG_QUALITY, out) }
+            shrunk.outputStream().use { out ->
+                require(scaled.compress(format, IMAGE_JPEG_QUALITY, out)) { "图片压缩失败" }
+            }
+            // 压缩产物本身也得是能解码的图片，否则宁可用未经压缩的原图。
+            require(isDecodableImage(shrunk)) { "压缩产物不可解码" }
+            java.nio.file.Files.move(
+                shrunk.toPath(),
+                file.toPath(),
+                java.nio.file.StandardCopyOption.REPLACE_EXISTING,
+            )
         } finally {
+            // 无论成败都清掉侧文件：成功时它已经被 move 走（delete 无副作用），
+            // 失败时留着就是垃圾。
+            shrunk.delete()
             if (scaled !== decoded) scaled.recycle()
             decoded.recycle()
         }

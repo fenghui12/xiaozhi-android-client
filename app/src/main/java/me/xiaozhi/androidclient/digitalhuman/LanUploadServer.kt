@@ -15,37 +15,107 @@ import java.util.concurrent.Executors
 import me.xiaozhi.androidclient.model.DigitalHumanSlot
 import me.xiaozhi.androidclient.model.RoleProfile
 
-data class VideoUploadSession(
+/**
+ * 扫码上传的**目标**。
+ *
+ * 原来这套只服务「某一段角色形象视频」，但立绘和头像同样是"用户手机里的一个文件"——
+ * 而客户那边**没有 ADB、也不方便用设备上的文件选择器**，只给「本机」入口等于这条路走不通。
+ * 所以三者共用同一条扫码通道，差异（标题、接受的文件类型、导入后调哪个方法）收在这里。
+ */
+sealed interface UploadTarget {
+    /** 显示给用户的槽位名，会出现在扫码弹窗标题和上传页上。 */
+    val label: String
+
+    /** `<input accept>` 的值。 */
+    val accept: String
+
+    /** 上传页的图标与标题。 */
+    val icon: String
+    val title: String
+
+    /** 上传页的提示文案。 */
+    val hint: String
+
+    /** 页面里 `xhr.setRequestHeader('Content-Type', ...)` 用的值。 */
+    val contentType: String
+
+    /** 落到缓存目录时用的扩展名。 */
+    val tempSuffix: String
+
+    data class Video(val slot: DigitalHumanSlot) : UploadTarget {
+        override val label get() = slot.label
+        override val accept get() = "video/mp4,video/*"
+        override val icon get() = "🎬"
+        override val title get() = "上传角色形象视频"
+        override val hint get() = "点击选择本地 MP4 视频 · 建议时长 0.5 ~ 15 秒，文件 ≤ 100MB"
+        override val contentType get() = "video/mp4"
+        override val tempSuffix get() = ".mp4"
+    }
+
+    data object Portrait : UploadTarget {
+        override val label get() = "角色立绘"
+        override val accept get() = "image/*"
+        override val icon get() = "🖼️"
+        override val title get() = "上传角色立绘"
+        override val hint get() = "点击选择图片 · 建议竖图，会自动压缩到长边 2048"
+        override val contentType get() = "application/octet-stream"
+        override val tempSuffix get() = ".img"
+    }
+
+    data object Avatar : UploadTarget {
+        override val label get() = "角色头像"
+        override val accept get() = "image/*"
+        override val icon get() = "🙂"
+        override val title get() = "上传角色头像"
+        override val hint get() = "点击选择图片 · 建议正方形，会自动压缩到长边 512"
+        override val contentType get() = "application/octet-stream"
+        override val tempSuffix get() = ".img"
+    }
+}
+
+data class UploadSession(
     val token: String,
     val port: Int,
     val role: RoleProfile,
-    val slot: DigitalHumanSlot,
+    val target: UploadTarget,
     val url: String,
 )
 
-class LanVideoUploadServer(
+/**
+ * 局域网扫码上传服务：设备上开一个一次性 HTTP 口，手机扫码打开页面选文件传过来。
+ *
+ * 这个类**只负责收文件**，收完交给 [importFile] 去解析/校验/落盘。
+ * 视频、立绘、头像的差异全部由 [UploadTarget] 描述，这里不再有"只认 mp4"的假设。
+ *
+ * @param importFile 把收到的临时文件导入角色，返回成功消息或失败原因。
+ * @param onImported 导入成功后的回调，第一个参数是**本次会话的 token**。
+ *   带 token 是必要的：旧会话的上传可能在我们已经开了新弹窗之后才完成，
+ *   调用方据此判断"这个结果是不是当前这次会话的"，否则会把上一个目标的结果
+ *   显示在新弹窗里（用户还没传就显示"成功"）。
+ */
+class LanUploadServer(
     private val context: Context,
-    private val assetManager: DigitalHumanAssetManager,
-    private val onImported: (RoleProfile, DigitalHumanSlot, String) -> Unit,
+    private val importFile: (RoleProfile, UploadTarget, File) -> Result<String>,
+    private val onImported: (String, RoleProfile, UploadTarget, String) -> Unit,
 ) {
     @Volatile
     private var serverSocket: ServerSocket? = null
     private val executor = Executors.newCachedThreadPool()
 
     @Synchronized
-    fun start(role: RoleProfile, slot: DigitalHumanSlot): VideoUploadSession {
+    fun start(role: RoleProfile, target: UploadTarget): UploadSession {
         stop()
         val socket = ServerSocket(0)
         serverSocket = socket
         val token = UUID.randomUUID().toString().replace("-", "")
         val host = resolveLocalIp()
         val url = "http://$host:${socket.localPort}/upload?token=$token"
-        executor.execute { acceptLoop(socket, role, slot, token) }
-        return VideoUploadSession(
+        executor.execute { acceptLoop(socket, role, target, token) }
+        return UploadSession(
             token = token,
             port = socket.localPort,
             role = role,
-            slot = slot,
+            target = target,
             url = url,
         )
     }
@@ -56,13 +126,13 @@ class LanVideoUploadServer(
         serverSocket = null
     }
 
-    private fun acceptLoop(socket: ServerSocket, role: RoleProfile, slot: DigitalHumanSlot, token: String) {
+    private fun acceptLoop(socket: ServerSocket, role: RoleProfile, target: UploadTarget, token: String) {
         while (!socket.isClosed) {
             try {
                 val client = socket.accept()
                 executor.execute {
                     runCatching {
-                        client.use { handle(it, role, slot, token) }
+                        client.use { handle(it, role, target, token) }
                     }
                 }
             } catch (_: Exception) {
@@ -71,7 +141,7 @@ class LanVideoUploadServer(
         }
     }
 
-    private fun handle(client: Socket, role: RoleProfile, slot: DigitalHumanSlot, token: String) {
+    private fun handle(client: Socket, role: RoleProfile, target: UploadTarget, token: String) {
         client.soTimeout = 30_000
         val input = BufferedInputStream(client.getInputStream())
         val header = readHeader(input)
@@ -82,7 +152,7 @@ class LanVideoUploadServer(
         }
 
         if (header.startsWith("GET /upload?token=$token ") || header.startsWith("GET /upload?token=$token\r") || header.startsWith("GET /upload?token=$token\n")) {
-            val html = buildUploadHtml(role.displayName, slot.label, token)
+            val html = buildUploadHtml(role.displayName, target, token)
             respond(client, 200, html, "text/html; charset=utf-8")
             return
         }
@@ -99,7 +169,7 @@ class LanVideoUploadServer(
                 return
             }
 
-            val temporary = File(context.cacheDir, "video-upload-${System.nanoTime()}.mp4")
+            val temporary = File(context.cacheDir, "upload-${System.nanoTime()}${target.tempSuffix}")
             try {
                 temporary.outputStream().use { output ->
                     var remaining = length
@@ -113,11 +183,11 @@ class LanVideoUploadServer(
                     require(remaining == 0L) { "上传内容不完整" }
                 }
 
-                val imported = assetManager.importVideoFile(role, slot, temporary).getOrThrow()
-                onImported(role, slot, imported)
-                respondJson(client, 200, true, "上传并导入成功！已同步至小智设备。")
+                val imported = importFile(role, target, temporary).getOrThrow()
+                onImported(token, role, target, imported)
+                respondJson(client, 200, true, imported)
             } catch (e: Exception) {
-                respondJson(client, 400, false, "视频导入校验失败: ${e.message ?: "未知错误"}")
+                respondJson(client, 400, false, "${target.label}导入校验失败: ${e.message ?: "未知错误"}")
             } finally {
                 temporary.delete()
             }
@@ -134,53 +204,55 @@ class LanVideoUploadServer(
             val byte = input.read()
             if (byte == -1) break
             out.write(byte)
-            when {
-                matched == 0 && byte == '\r'.code -> matched = 1
-                matched == 1 && byte == '\n'.code -> matched = 2
-                matched == 2 && byte == '\r'.code -> matched = 3
-                matched == 3 && byte == '\n'.code -> break
-                byte == '\n'.code -> break
-                else -> matched = 0
+            matched = when {
+                matched == 0 && byte == '\r'.code -> 1
+                matched == 1 && byte == '\n'.code -> 2
+                matched == 2 && byte == '\r'.code -> 3
+                matched == 3 && byte == '\n'.code -> 4
+                byte == '\r'.code -> 1
+                else -> 0
             }
-            if (out.size() > 8192) break
+            if (matched == 4) break
+            if (out.size() > 16 * 1024) break
         }
-        return out.toString(Charsets.UTF_8.name())
+        return out.toString("ISO-8859-1")
     }
 
     private fun respondJson(client: Socket, status: Int, success: Boolean, message: String) {
-        val json = """{"ok":$success,"message":"${escapeJson(message)}"}"""
-        respond(client, status, json, "application/json; charset=utf-8")
+        respond(client, status, """{"ok":$success,"message":"${escapeJson(message)}"}""", "application/json; charset=utf-8")
     }
 
     private fun respond(client: Socket, status: Int, content: String, contentType: String) {
-        val body = content.toByteArray(Charsets.UTF_8)
-        val statusMsg = if (status == 200) "OK" else if (status == 404) "Not Found" else if (status == 403) "Forbidden" else "Bad Request"
-        runCatching {
-            val output = client.getOutputStream()
-            output.write("HTTP/1.1 $status $statusMsg\r\nContent-Type: $contentType\r\nContent-Length: ${body.size}\r\nConnection: close\r\n\r\n".toByteArray())
-            output.write(body)
-            output.flush()
+        val bytes = content.toByteArray(Charsets.UTF_8)
+        val head = buildString {
+            append("HTTP/1.1 $status ${if (status == 200) "OK" else "Error"}\r\n")
+            append("Content-Type: $contentType\r\n")
+            append("Content-Length: ${bytes.size}\r\n")
+            append("Connection: close\r\n\r\n")
+        }
+        client.getOutputStream().use { out ->
+            out.write(head.toByteArray(Charsets.ISO_8859_1))
+            out.write(bytes)
+            out.flush()
         }
     }
 
     private fun escapeJson(str: String): String =
-        str.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "\\r")
+        str.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n").replace("\r", "")
 
     private fun resolveLocalIp(): String {
         runCatching {
-            val wifiManager = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            val ipInt = wifiManager?.connectionInfo?.ipAddress ?: 0
-            if (ipInt != 0) {
-                return Formatter.formatIpAddress(ipInt)
-            }
+            val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
+            @Suppress("DEPRECATION")
+            val ip = Formatter.formatIpAddress(wifi.connectionInfo.ipAddress)
+            if (ip.isNotBlank() && ip != "0.0.0.0") return ip
         }
-        val interfaces = NetworkInterface.getNetworkInterfaces() ?: return "127.0.0.1"
-        for (item in interfaces.toList()) {
-            if (!item.isUp || item.isLoopback) continue
-            for (addr in item.inetAddresses.toList()) {
-                val host = addr.hostAddress
-                if (!addr.isLoopbackAddress && addr is InetAddress && host != null && !host.contains(':')) {
-                    return host
+        runCatching {
+            for (nif in NetworkInterface.getNetworkInterfaces()) {
+                for (addr in nif.inetAddresses) {
+                    if (!addr.isLoopbackAddress && addr is InetAddress && addr.hostAddress?.contains(':') == false) {
+                        return addr.hostAddress ?: continue
+                    }
                 }
             }
         }
@@ -188,14 +260,20 @@ class LanVideoUploadServer(
     }
 
     companion object {
-        fun buildUploadHtml(roleName: String, slotLabel: String, token: String): String {
+        fun buildUploadHtml(roleName: String, target: UploadTarget, token: String): String {
+            val icon = target.icon
+            val title = target.title
+            val slotLabel = target.label
+            val accept = target.accept
+            val hint = target.hint
+            val contentType = target.contentType
             return """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>导入数字人视频 - 小智</title>
+    <title>$title - 小智</title>
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body {
@@ -253,62 +331,57 @@ class LanVideoUploadServer(
         .file-info {
             font-size: 14px;
             color: #374151;
-            margin-top: 8px;
-            font-weight: 500;
             word-break: break-all;
         }
         .hint {
-            font-size: 12px;
-            color: #6b7280;
-            line-height: 1.5;
+            font-size: 13px;
+            color: #9ca3af;
             margin-top: 6px;
         }
         .btn {
-            display: block;
             width: 100%;
-            background: #4f46e5;
-            color: #ffffff;
+            border: none;
+            border-radius: 12px;
+            padding: 14px;
             font-size: 16px;
             font-weight: 600;
-            padding: 13px;
-            border-radius: 12px;
-            border: none;
+            color: #ffffff;
+            background: #4f46e5;
             cursor: pointer;
-            transition: background 0.2s, opacity 0.2s;
+            transition: opacity 0.2s;
         }
         .btn:disabled {
-            background: #9ca3af;
+            background: #c7d2fe;
             cursor: not-allowed;
-            opacity: 0.7;
         }
         .progress-box {
             display: none;
             margin-top: 18px;
         }
         .progress-bar-bg {
-            background: #e5e7eb;
             height: 8px;
+            background: #e5e7eb;
             border-radius: 9999px;
             overflow: hidden;
-            margin-bottom: 6px;
         }
         .progress-bar-fg {
-            background: #4f46e5;
             height: 100%;
             width: 0%;
-            transition: width 0.15s ease-out;
+            background: #4f46e5;
+            transition: width 0.2s;
         }
         .progress-text {
-            font-size: 12px;
-            color: #4b5563;
+            font-size: 13px;
+            color: #6b7280;
+            margin-top: 8px;
         }
         .msg {
-            margin-top: 16px;
-            font-size: 14px;
-            font-weight: 500;
             display: none;
-            padding: 10px;
+            margin-top: 16px;
+            padding: 12px;
             border-radius: 10px;
+            font-size: 14px;
+            line-height: 1.5;
         }
         .msg.success {
             background: #ecfdf5;
@@ -324,16 +397,15 @@ class LanVideoUploadServer(
 </head>
 <body>
     <div class="card">
-        <div class="icon">🎬</div>
-        <h1>上传数字人视频</h1>
+        <div class="icon">$icon</div>
+        <h1>$title</h1>
         <div class="meta-tag">角色：$roleName · 状态：$slotLabel</div>
 
-        <input type="file" id="fileInput" accept="video/mp4,video/*" style="display: none;">
+        <input type="file" id="fileInput" accept="$accept" style="display: none;">
 
         <div class="dropzone" id="dropzone">
             <div id="dropPrompt">
-                <p style="font-size: 15px; font-weight: 600; color: #374151;">点击选择本地 MP4 视频</p>
-                <p class="hint">建议时长 0.5 ~ 15 秒，文件 ≤ 100MB</p>
+                <p style="font-size: 15px; font-weight: 600; color: #374151;">$hint</p>
             </div>
             <div id="fileInfo" class="file-info" style="display: none;"></div>
         </div>
@@ -363,6 +435,26 @@ class LanVideoUploadServer(
 
         let selectedFile = null;
 
+        // 统一的提示出口。
+        //
+        // 必须**显式写内联 display**：`.msg` 基础类带 `display: none`，而下面把它藏起来时
+        // 用的是 `style.display = 'none'`（**内联样式**），内联优先级高于
+        // `.msg.error { display: block }` —— 只改 className 的话失败提示永远不会显示。
+        // 实测踩过：选错文件后手机上什么都不发生，用户以为卡死。
+        function showStatus(kind, text) {
+            statusMsg.className = 'msg ' + kind;
+            statusMsg.style.display = 'block';
+            statusMsg.textContent = text;
+        }
+
+        // 失败后必须把界面**恢复成可以重选**。原来只在开始时禁用、失败分支没恢复 fileInput，
+        // 于是选错一次就只能刷新网页才能重来。
+        function resetForRetry() {
+            uploadBtn.disabled = false;
+            fileInput.disabled = false;
+            dropzone.style.pointerEvents = 'auto';
+        }
+
         dropzone.addEventListener('click', () => fileInput.click());
 
         fileInput.addEventListener('change', (e) => {
@@ -373,7 +465,6 @@ class LanVideoUploadServer(
                 const sizeMb = (selectedFile.size / (1024 * 1024)).toFixed(2);
                 fileInfo.innerHTML = '已选择：<strong>' + escapeHtml(selectedFile.name) + '</strong> (' + sizeMb + ' MB)';
                 uploadBtn.disabled = false;
-                statusMsg.className = 'msg';
                 statusMsg.style.display = 'none';
             }
         });
@@ -385,12 +476,11 @@ class LanVideoUploadServer(
             fileInput.disabled = true;
             dropzone.style.pointerEvents = 'none';
             progressBox.style.display = 'block';
-            statusMsg.className = 'msg';
             statusMsg.style.display = 'none';
 
             const xhr = new XMLHttpRequest();
             xhr.open('POST', '/upload?token=$token', true);
-            xhr.setRequestHeader('Content-Type', 'video/mp4');
+            xhr.setRequestHeader('Content-Type', '$contentType');
 
             xhr.upload.onprogress = (e) => {
                 if (e.lengthComputable) {
@@ -409,24 +499,21 @@ class LanVideoUploadServer(
                 if (xhr.status === 200 && resp && resp.ok) {
                     progressBar.style.width = '100%';
                     progressText.textContent = '校验并导入成功！';
-                    statusMsg.className = 'msg success';
-                    statusMsg.textContent = '🎉 ' + (resp.message || '导入成功！小智设备已同步更新。');
+                    showStatus('success', '🎉 ' + (resp.message || '导入成功！小智设备已同步更新。'));
                     uploadBtn.style.display = 'none';
                     dropzone.style.display = 'none';
                 } else {
                     const errMsg = (resp && resp.message) ? resp.message : ('上传失败 (HTTP ' + xhr.status + ')');
-                    statusMsg.className = 'msg error';
-                    statusMsg.textContent = '❌ ' + errMsg;
-                    uploadBtn.disabled = false;
-                    dropzone.style.pointerEvents = 'auto';
+                    showStatus('error', '❌ ' + errMsg);
+                    progressBox.style.display = 'none';
+                    resetForRetry();
                 }
             };
 
             xhr.onerror = () => {
-                statusMsg.className = 'msg error';
-                statusMsg.textContent = '❌ 网络连接错误，请检查是否与小智处于同一 WiFi。';
-                uploadBtn.disabled = false;
-                dropzone.style.pointerEvents = 'auto';
+                showStatus('error', '❌ 网络连接错误，请检查是否与小智处于同一 WiFi。');
+                progressBox.style.display = 'none';
+                resetForRetry();
             };
 
             xhr.send(selectedFile);

@@ -130,8 +130,9 @@ import me.xiaozhi.androidclient.model.UiState
 import me.xiaozhi.androidclient.model.DigitalHumanSlot
 import me.xiaozhi.androidclient.digitalhuman.CoverVideoView
 import me.xiaozhi.androidclient.digitalhuman.DigitalHumanAssetManager
-import me.xiaozhi.androidclient.digitalhuman.LanVideoUploadServer
-import me.xiaozhi.androidclient.digitalhuman.VideoUploadSession
+import me.xiaozhi.androidclient.digitalhuman.LanUploadServer
+import me.xiaozhi.androidclient.digitalhuman.UploadSession
+import me.xiaozhi.androidclient.digitalhuman.UploadTarget
 import com.google.zxing.BarcodeFormat
 import com.google.zxing.MultiFormatWriter
 import me.xiaozhi.androidclient.model.hasCompleteDigitalHuman
@@ -263,13 +264,33 @@ private fun XiaozhiApp() {
     val state by viewModel.uiState.collectAsStateWithLifecycle()
     val latestState by rememberUpdatedState(state)
     val context = LocalContext.current
-    var uploadSession by remember { mutableStateOf<VideoUploadSession?>(null) }
+    var uploadSession by remember { mutableStateOf<UploadSession?>(null) }
     var uploadSuccessMessage by remember { mutableStateOf<String?>(null) }
+    // 扫码上传是客户**唯一**能用的素材导入通道 —— 他们没有 ADB，也不方便用设备上的文件选择器。
+    // 所以视频、立绘、头像三者共用这一条通道，差异由 UploadTarget 描述。
     val uploadServer = remember {
-        LanVideoUploadServer(context, DigitalHumanAssetManager(context)) { role, slot, path ->
-            viewModel.updateRoleVideoPath(role.id, slot, path)
-            uploadSuccessMessage = "${role.displayName}的${slot.label}视频导入成功！"
-        }
+        val assetManager = DigitalHumanAssetManager(context)
+        LanUploadServer(
+            context = context,
+            importFile = { role, target, file ->
+                when (target) {
+                    // 视频导入返回的是**落盘路径**，必须回写进角色配置，否则界面不认；
+                    // 立绘/头像的导入函数内部已经写好了配置，只返回一句结果消息。
+                    // 所以这里统一成「返回给用户看的结果消息」，路径的事各自在分支里办完。
+                    is UploadTarget.Video -> assetManager.importVideoFile(role, target.slot, file)
+                        .onSuccess { path -> viewModel.updateRoleVideoPath(role.id, target.slot, path) }
+                        .map { "${role.displayName}的${target.slot.label}视频导入成功！" }
+                    UploadTarget.Portrait -> viewModel.importRolePortraitFromFile(role.id, file)
+                    UploadTarget.Avatar -> viewModel.importRoleAvatarFromFile(role.id, file)
+                }
+            },
+            onImported = { token, _, _, message ->
+                // 只认**当前这次会话**的结果。旧会话的上传可能在我们已经开了新弹窗之后
+                // 才完成，不加这道判断就会把上一个目标的结果显示在新弹窗里 ——
+                // 用户还没传就显示"导入成功"，是最容易让人以为程序坏了的一类反馈。
+                if (uploadSession?.token == token) uploadSuccessMessage = message
+            },
+        )
     }
     val lifecycleOwner = LocalLifecycleOwner.current
     var currentScreen by rememberSaveable { mutableStateOf(AppScreen.CHAT) }
@@ -450,6 +471,7 @@ private fun XiaozhiApp() {
                         "import_demo_portrait" -> {
                             val file = File(context.getExternalFilesDir(null), "demo_media/portrait.jpg")
                             viewModel.importRolePortraitFromFile(latestState.activeRoleId, file)
+                                .getOrElse { "导入立绘失败：${it.message}" }
                         }
                         "clear_portrait" -> {
                             viewModel.clearRolePortrait(latestState.activeRoleId)
@@ -490,15 +512,15 @@ private fun XiaozhiApp() {
         onDeleteRole = viewModel::deleteRole,
         onCheckForUpdate = viewModel::checkForAppUpdate,
         onStartUpdate = viewModel::startDownloadAndInstallUpdate,
-        onStartVideoUpload = { roleId, slot ->
+        onStartUpload = { roleId, target ->
             latestState.roleProfiles.firstOrNull { it.id == roleId }?.let { role ->
                 runCatching {
-                    uploadSession = uploadServer.start(role, slot)
+                    uploadSession = uploadServer.start(role, target)
                 }.onFailure { error ->
-                    android.util.Log.e("LanVideoUpload", "Failed to start upload server", error)
+                    android.util.Log.e("LanUpload", "Failed to start upload server", error)
                 }
             } ?: run {
-                android.util.Log.e("LanVideoUpload", "Role not found for id: $roleId")
+                android.util.Log.e("LanUpload", "Role not found for id: $roleId")
             }
         },
         onAbortSpeaking = viewModel::abortSpeaking,
@@ -598,7 +620,7 @@ private fun XiaozhiScreen(
     onDeleteRole: (String) -> Unit,
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
-    onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
+    onStartUpload: (String, UploadTarget) -> Unit,
     onAbortSpeaking: () -> Unit,
     onClearRoleAvatar: (String) -> Unit,
     onClearRolePortrait: (String) -> Unit,
@@ -711,7 +733,7 @@ private fun XiaozhiScreen(
                         onDeleteRole = onDeleteRole,
                         onCheckForUpdate = onCheckForUpdate,
                         onStartUpdate = onStartUpdate,
-                        onStartVideoUpload = onStartVideoUpload,
+                        onStartUpload = onStartUpload,
                         onClearRoleAvatar = onClearRoleAvatar,
                         onClearRolePortrait = onClearRolePortrait,
                         onClearRoleVideo = onClearRoleVideo,
@@ -1256,7 +1278,7 @@ private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
 
 @Composable
 private fun UploadQrDialog(
-    uploadSession: VideoUploadSession,
+    uploadSession: UploadSession,
     successMessage: String?,
     onDismiss: () -> Unit,
 ) {
@@ -1275,7 +1297,7 @@ private fun UploadQrDialog(
     }
     AlertDialog(
         onDismissRequest = onDismiss,
-        title = { Text("手机扫码导入${uploadSession.slot.label}") },
+        title = { Text("手机扫码导入${uploadSession.target.label}") },
         text = {
             Column(
                 horizontalAlignment = Alignment.CenterHorizontally,
@@ -1313,7 +1335,7 @@ private fun UploadQrDialog(
                     color = MaterialTheme.colorScheme.primary,
                 )
                 Text(
-                    "手机连接同一 WiFi 扫码，选择 MP4 视频直接上传",
+                    "手机连接同一 WiFi 扫码，选择文件直接上传",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
@@ -1437,7 +1459,7 @@ private fun SettingsScreen(
     onDeleteRole: (String) -> Unit,
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
-    onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
+    onStartUpload: (String, UploadTarget) -> Unit,
     onClearRoleAvatar: (String) -> Unit,
     onClearRolePortrait: (String) -> Unit,
     onClearRoleVideo: (String, DigitalHumanSlot) -> Unit,
@@ -1459,7 +1481,7 @@ private fun SettingsScreen(
             onPickRoleAvatar = onPickRoleAvatar,
             onPickRolePortrait = onPickRolePortrait,
             onPickRoleVideo = onPickRoleVideo,
-            onStartVideoUpload = onStartVideoUpload,
+            onStartUpload = onStartUpload,
             onClearRoleAvatar = onClearRoleAvatar,
             onClearRolePortrait = onClearRolePortrait,
             onClearRoleVideo = onClearRoleVideo,
@@ -1651,7 +1673,7 @@ private fun RoleProfilesCard(
     onPickRoleAvatar: (String) -> Unit,
     onPickRolePortrait: (String) -> Unit,
     onPickRoleVideo: (String, DigitalHumanSlot) -> Unit,
-    onStartVideoUpload: (String, DigitalHumanSlot) -> Unit,
+    onStartUpload: (String, UploadTarget) -> Unit,
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
     onDeleteRole: (String) -> Unit,
@@ -1725,13 +1747,13 @@ private fun RoleProfilesCard(
             onClearPortrait = { editingRole?.id?.let(onClearRolePortrait) },
             onClearVideo = { slot -> editingRole?.id?.let { onClearRoleVideo(it, slot) } },
             onPickVideo = { slot -> editingRole?.id?.let { onPickRoleVideo(it, slot) } },
-            onStartVideoUpload = { slot ->
+            onStartUpload = { target ->
                 val targetRole = editingRole
-                android.util.Log.d("LanVideoUpload", "RoleEditorDialog click 扫码: slot=$slot, editingRole=$targetRole")
+                android.util.Log.d("LanUpload", "RoleEditorDialog click 扫码: target=${target.label}, editingRole=$targetRole")
                 targetRole?.id?.let { id ->
-                    onStartVideoUpload(id, slot)
+                    onStartUpload(id, target)
                 } ?: run {
-                    android.util.Log.e("LanVideoUpload", "editingRole is null when clicking 扫码")
+                    android.util.Log.e("LanUpload", "editingRole is null when clicking 扫码")
                 }
             },
             onDismiss = {
@@ -1802,7 +1824,7 @@ private fun RoleEditorDialog(
     onPickAvatar: () -> Unit,
     onPickPortrait: () -> Unit,
     onPickVideo: (DigitalHumanSlot) -> Unit,
-    onStartVideoUpload: (DigitalHumanSlot) -> Unit,
+    onStartUpload: (UploadTarget) -> Unit,
     onClearAvatar: () -> Unit,
     onClearPortrait: () -> Unit,
     onClearVideo: (DigitalHumanSlot) -> Unit,
@@ -1828,6 +1850,8 @@ private fun RoleEditorDialog(
                             modifier = Modifier.size(64.dp),
                         )
                         OutlinedButton(onClick = onPickAvatar) { Text("更换头像") }
+                        // 客户没有 ADB、也不方便用设备上的文件选择器，「扫码」才是他们唯一能走通的入口。
+                        OutlinedButton(onClick = { onStartUpload(UploadTarget.Avatar) }) { Text("扫码") }
                         if (role.avatarPath.isNotBlank() && File(role.avatarPath).exists()) {
                             TextButton(onClick = onClearAvatar) {
                                 Text("清除", color = InterruptRed)
@@ -1848,6 +1872,8 @@ private fun RoleEditorDialog(
                         )
                         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                             OutlinedButton(onClick = onPickPortrait) { Text("选择立绘") }
+                            // 同头像：立绘也必须能扫码传，否则客户端根本用不了这个功能。
+                            OutlinedButton(onClick = { onStartUpload(UploadTarget.Portrait) }) { Text("扫码") }
                             if (role.portraitPath.isNotBlank() && File(role.portraitPath).exists()) {
                                 TextButton(onClick = onClearPortrait) {
                                     Text("删除", color = InterruptRed)
@@ -1880,7 +1906,7 @@ private fun RoleEditorDialog(
                             Text(if (configured) "${slot.label} · 已配置" else "${slot.label} · 未配置")
                             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                                 OutlinedButton(onClick = { onPickVideo(slot) }) { Text("本机") }
-                                OutlinedButton(onClick = { onStartVideoUpload(slot) }) { Text("扫码") }
+                                OutlinedButton(onClick = { onStartUpload(UploadTarget.Video(slot)) }) { Text("扫码") }
                                 // 逐段删除。原来只有一个"清空全部"的垃圾桶入口，
                                 // 一次把四段视频 + 头像 + 立绘全删掉，用户说"成本太大"。
                                 if (configured) {
