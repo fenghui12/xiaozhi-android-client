@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!-- 「瓶中星」自适应图标。
+     背景是品牌浅蓝纯色（见 values/colors.xml 的说明），前景是瓶子+星星的位图，
+     已按自适应图标安全区缩放（logo 占画布 62%，安全区是 66/108）。
+     前景位图在 mipmap-{mdpi,hdpi,xhdpi,xxhdpi,xxxhdpi}/ic_launcher_foreground.png。
+
+     注：minSdk=26，Android 8.0 起全部支持自适应图标，
+     所以这里不需要再放传统的正方形 ic_launcher.png。 -->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
-    <background android:drawable="@drawable/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <background android:drawable="@color/ic_launcher_background" />
+    <foreground android:drawable="@mipmap/ic_launcher_foreground" />
 </adaptive-icon>

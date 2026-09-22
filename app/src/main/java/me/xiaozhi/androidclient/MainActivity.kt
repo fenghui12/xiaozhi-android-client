@@ -5,9 +5,11 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import java.io.File
 import android.os.Build
+import android.media.MediaPlayer
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.FrameLayout
+import android.net.Uri
 import android.widget.VideoView
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
@@ -172,6 +174,49 @@ private const val STARTUP_OVERLAY_TIMEOUT_MS = 25_000L
 
 /** 自检界面最短显示时长——太短就读不到自检结论，等于没做自检。 */
 private const val STARTUP_OVERLAY_MIN_MS = 2_500L
+
+/**
+ * 开机动画的兜底时限。素材本身 6.04 秒，这里给到 9 秒。
+ *
+ * **这不是可有可无的保险**：动画是自检通过后进主界面的唯一通道，
+ * 一旦解码失败、`onCompletion` 不回调（实测视频解码在低配上确实会这样），
+ * 没有这个兜底用户就会永远停在开机画面上——比不放动画严重得多。
+ */
+private const val BOOT_ANIMATION_TIMEOUT_MS = 9_000L
+
+/**
+ * 开机动画播完后，遮罩再多留这么久才撤。
+ *
+ * **这不是为了好看，是为了不黑屏。** 实测时间线（加了日志之后）：
+ *
+ * ```
+ * 06:11:29.630  [开机动画] 播放结束
+ * 06:11:29.957  [数字人] View 已创建      ← 中间 327ms：遮罩已撤、主界面还没画出第一帧
+ * 06:11:30.525  [数字人] 首帧渲染
+ * ```
+ *
+ * 那 327ms 里窗口是空的，整屏黑。多留一段时间让主界面在遮罩后面把首帧画完，撤掉时就已经有内容了。
+ * 取值按实测 0.9 秒的总落差留了余量。
+ */
+private const val BOOT_COVER_LINGER_MS = 1_200L
+
+/**
+ * 数字人视频「等首帧」的两个常量。
+ *
+ * 视频渲染出第一帧之前是黑的，而它是 SurfaceView（独立合成层，盖在所有 Compose 内容之上），
+ * 所以那段时间整块区域是黑的 —— 实测开机动画结束后有 0.47 秒。做法是先把它挪到屏幕外，
+ * 等首帧回调再挪回来。
+ *
+ * [OFFSCREEN_X] 要足够大，超出任何屏幕宽度即可；用 view 宽度而不是固定值更稳妥，
+ * 这里取一个远大于任何手机/板卡宽度的像素数。
+ *
+ * [DIGITAL_HUMAN_FIRST_FRAME_FALLBACK_MS] 是兜底：万一某台机器不回调
+ * MEDIA_INFO_VIDEO_RENDERING_START，画面会永远停在屏幕外。实测这块板子**会**回调
+ * （logcat 里的 `MediaPlayerNative: info/warning (3, 0)`），但不能赌每一台都一样。
+ */
+private const val OFFSCREEN_X = 10_000f
+private const val DIGITAL_HUMAN_FIRST_FRAME_FALLBACK_MS = 1_500L
+
 
 // 立绘解码的像素上限与采样率算法已挪到 util/ImageSampling.kt —— 那是纯函数，
 // 可以在 JVM 单元测试里直接验证，不必起真机。这里不再保留同名常量，避免两份定义走偏。
@@ -584,12 +629,29 @@ private fun XiaozhiScreen(
     // 不到两秒——那行红色的「没有检测到摄像头麦克风」根本来不及看，等于没提示。
     // 而麦克风掉了意味着这台设备**完全没法交互**（它唯一的麦克风在 USB 摄像头上），
     // 正是最该把话说清楚的时候。想继续用的人可以点「仍然继续」。
-    val showStartupOverlay = !startupOverlayDismissed &&
-        (
-            !startupMinShown ||
-                (!everConnected && !startupGraceElapsed) ||
-                !state.microphoneReady
-            )
+    //
+    // 下面这个 `checksPassed` 就是把上面那段判据取反后提出来，好让「自检」和
+    // 「开机动画」成为清晰的两段：自检通过 -> 播动画 -> 让位。以前只有一段，
+    // 想插动画就只能再去改那串复合条件，很容易把自检逻辑改坏。
+    val checksPassed = startupMinShown &&
+        (everConnected || startupGraceElapsed) &&
+        state.microphoneReady
+
+    val showStartupOverlay = !startupOverlayDismissed && !checksPassed
+
+    // 开机动画：自检通过那一刻起播一次，播完（或超时/解码失败）才让位给主界面。
+    // 用户点过「仍然继续」时跳过——那表示他已经知道有问题、只想快点用。
+    var bootAnimationDone by rememberSaveable { mutableStateOf(false) }
+    // 视频播完 ≠ 可以撤遮罩。撤早了会露出一段黑屏，原因见 BOOT_COVER_LINGER_MS。
+    var bootCoverReleased by remember { mutableStateOf(false) }
+    LaunchedEffect(bootAnimationDone) {
+        if (bootAnimationDone) {
+            delay(BOOT_COVER_LINGER_MS)
+            bootCoverReleased = true
+        }
+    }
+    val showBootAnimation =
+        !startupOverlayDismissed && checksPassed && !bootCoverReleased
 
     Scaffold(
         containerColor = if (currentScreen == AppScreen.SETTINGS) SettingsBackground else ChatBackground,
@@ -608,31 +670,53 @@ private fun XiaozhiScreen(
         },
     ) { padding ->
         Box(modifier = Modifier.fillMaxSize()) {
-            when (currentScreen) {
-                AppScreen.CHAT -> ChatScreen(
-                    state = state,
-                    padding = padding,
-                    onOpenSettings = onOpenSettings,
-                    onAbortSpeaking = onAbortSpeaking,
-                )
+            // 启动期间**完全不渲染主界面**。
+            //
+            // 这不是为了省性能，是没别的办法：数字人是 VideoView，而 VideoView 内部是
+            // **SurfaceView** —— 它在 SurfaceFlinger 里是**独立的合成层**，不参与普通 View 树的绘制。
+            // 所以无论给上面那层用 Compose 的 `background()` 还是真 View 的底色，**都盖不住它**。
+            //
+            // 实测那一闪的截图（800 宽，逐列与背景色 #F1F5FA 的偏差）：
+            //     x0~30   : 0        ← 被我们盖住了
+            //     x40~760 : 233~250  ← 数字人，720px 正好是视频宽度
+            //     x760~799: 0        ← 被我们盖住了
+            // 用户的原话是「先闪一帧让你看到了，然后再马上遮住，这个很拙劣」。
+            //
+            // 唯一可靠的做法是**让那个 surface 在启动期间根本不存在**，
+            // 也就是把主界面从组合里去掉。
+            //
+            // 注意后半段 `&& !bootAnimationDone`：动画**播完**之后就要让主界面开始组合，
+            // 哪怕遮罩还盖着（遮罩会多留 BOOT_COVER_LINGER_MS）。这样主界面能在这段时间里
+            // 把首帧画出来，撤遮罩时才不会露出空窗口。
+            val startupCoverVisible =
+                showStartupOverlay || (showBootAnimation && !bootAnimationDone)
+            if (!startupCoverVisible) {
+                when (currentScreen) {
+                    AppScreen.CHAT -> ChatScreen(
+                        state = state,
+                        padding = padding,
+                        onOpenSettings = onOpenSettings,
+                        onAbortSpeaking = onAbortSpeaking,
+                    )
 
-                AppScreen.SETTINGS -> SettingsScreen(
-                    state = state,
-                    padding = padding,
-                    onSelectRole = onSelectRole,
-                    onPickRoleAvatar = onPickRoleAvatar,
-                    onPickRolePortrait = onPickRolePortrait,
-                    onPickRoleVideo = onPickRoleVideo,
-                    onAddRole = onAddRole,
-                    onUpdateRole = onUpdateRole,
-                    onDeleteRole = onDeleteRole,
-                    onCheckForUpdate = onCheckForUpdate,
-                    onStartUpdate = onStartUpdate,
-                    onStartVideoUpload = onStartVideoUpload,
-                    onClearRoleAvatar = onClearRoleAvatar,
-                    onClearRolePortrait = onClearRolePortrait,
-                    onClearRoleVideo = onClearRoleVideo,
-                )
+                    AppScreen.SETTINGS -> SettingsScreen(
+                        state = state,
+                        padding = padding,
+                        onSelectRole = onSelectRole,
+                        onPickRoleAvatar = onPickRoleAvatar,
+                        onPickRolePortrait = onPickRolePortrait,
+                        onPickRoleVideo = onPickRoleVideo,
+                        onAddRole = onAddRole,
+                        onUpdateRole = onUpdateRole,
+                        onDeleteRole = onDeleteRole,
+                        onCheckForUpdate = onCheckForUpdate,
+                        onStartUpdate = onStartUpdate,
+                        onStartVideoUpload = onStartVideoUpload,
+                        onClearRoleAvatar = onClearRoleAvatar,
+                        onClearRolePortrait = onClearRolePortrait,
+                        onClearRoleVideo = onClearRoleVideo,
+                    )
+                }
             }
 
             // 冷启动期间盖一层明确的进度界面：测试者把“开机后什么都没有”
@@ -648,6 +732,12 @@ private fun XiaozhiScreen(
                         null
                     },
                 )
+            }
+
+            // 自检全过、马上进主界面：播一次开机动画。
+            // 这台设备是开机自启的，所以每次开机都会看到，属于产品仪式感的一部分。
+            if (showBootAnimation) {
+                BootAnimationOverlay(onFinished = { bootAnimationDone = true })
             }
         }
     }
@@ -721,6 +811,110 @@ private fun StartupLoadingOverlay(state: UiState, onContinueAnyway: (() -> Unit)
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+        }
+    }
+}
+
+/**
+ * 开机动画：自检全部通过、马上要进主界面时播一次。
+ *
+ * 素材是「一个空瓶 → 星星从右上带光尾飞入 → 穿过瓶盖落入瓶中 → 在瓶底驻留发光」
+ * （`res/raw/boot_animation.mp4`，720x1280，6.04 秒，已去音轨）。
+ *
+ * ## 为什么整层是一个真 View，而不是 Compose 的 Box + background
+ *
+ * 这是实测踩出来的：`AndroidView` 里承载视频的是**真 Android View**，
+ * 它的绘制层级在 Compose 画布**之上**。所以用 `Modifier.background()` 给这层画背景
+ * **盖不住**数字人的 VideoView，现象有两个，用户原话是「很拙劣」：
+ *
+ *   1. 自检结束时先闪一帧数字人，动画才盖上来；
+ *   2. 视频是 9:16 而屏幕是 800x1280，两侧各留 40px，那两条边里**一直能看到数字人在闪**。
+ *
+ * 实测数据（动画播放中截图，左右各 40px 边带与 `#F1F5FA` 的最大偏差）：
+ * 启动窗口 0、自检中 0、**动画播放 250** —— 250 就是数字人的画面透出来了。
+ * 自检那会儿之所以干净，只是因为当时数字人还没加载完，属于运气好。
+ *
+ * 修法：底色改用**真 View（FrameLayout）自带的不透明背景**。它和数字人在同一绘制层，
+ * 且是在数字人之后创建的，所以盖得住。Compose 这边只负责摆放，不负责遮。
+ */
+@Composable
+private fun BootAnimationOverlay(onFinished: () -> Unit) {
+    // 用 rememberUpdatedState 而不是直接把 onFinished 捕进 LaunchedEffect：
+    // 后者会把协程绑死在首次组合时的那个 lambda 上，重组后仍调用旧闭包。
+    val finished by rememberUpdatedState(onFinished)
+    var done by remember { mutableStateOf(false) }
+
+    AndroidView(
+        modifier = Modifier.fillMaxSize(),
+        factory = { context ->
+            FrameLayout(context).apply {
+                // 底色取自 launch_background（#F1F5FA）。启动窗口、这层、视频自身的背景
+                // 三者同色，所以两侧留边看不出来。用资源而不是写字面量，改色时会跟着走。
+                setBackgroundColor(context.getColor(R.color.launch_background))
+
+                val video = VideoView(context)
+                addView(
+                    video,
+                    FrameLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        ViewGroup.LayoutParams.MATCH_PARENT,
+                        Gravity.CENTER,
+                    ),
+                )
+
+                // 按原比例居中「适配」（fit），不是铺满裁切——瓶子在画面正中，裁切会切到瓶子。
+                // 尺寸要等容器量完 + 视频解码拿到宽高之后才能算，两边谁后到都要重算一次。
+                var aspect = 0f
+                fun fitToScreen() {
+                    if (aspect <= 0f || width <= 0 || height <= 0) return
+                    val (w, h) = if (width.toFloat() / height > aspect) {
+                        (height * aspect).toInt() to height
+                    } else {
+                        width to (width / aspect).toInt()
+                    }
+                    video.layoutParams = FrameLayout.LayoutParams(w, h, Gravity.CENTER)
+                }
+                addOnLayoutChangeListener { _, _, _, _, _, _, _, _, _ -> fitToScreen() }
+
+                video.setOnPreparedListener { player ->
+                    android.util.Log.d("XiaozhiClient", "[开机动画] 开始播放")
+                    player.isLooping = false
+                    // 必须静音：素材已经去过音轨，这里再设一次是防呆——
+                    // 换成带声音的素材时不会突然在开机时放出一声响。
+                    player.setVolume(0f, 0f)
+                    if (player.videoHeight > 0) {
+                        aspect = player.videoWidth.toFloat() / player.videoHeight
+                    }
+                    fitToScreen()
+                    video.start()
+                }
+                video.setOnCompletionListener {
+                    android.util.Log.d("XiaozhiClient", "[开机动画] 播放结束")
+                    if (!done) {
+                        done = true
+                        finished()
+                    }
+                }
+                video.setOnErrorListener { _, _, _ ->
+                    // 解码失败也要放行，否则卡死在开机画面。
+                    if (!done) {
+                        done = true
+                        finished()
+                    }
+                    true
+                }
+                video.setVideoURI(
+                    Uri.parse("android.resource://${context.packageName}/${R.raw.boot_animation}")
+                )
+            }
+        },
+    )
+
+    LaunchedEffect(Unit) {
+        delay(BOOT_ANIMATION_TIMEOUT_MS)
+        if (!done) {
+            done = true
+            finished()
         }
     }
 }
@@ -989,7 +1183,29 @@ private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
                 clipChildren = true
                 addView(
                     CoverVideoView(context).apply {
+                        android.util.Log.d("XiaozhiClient", "[数字人] View 已创建")
                         setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                        // 视频渲染出第一帧之前，先把它**挪到屏幕外**。
+                        //
+                        // 为什么不用 INVISIBLE/GONE：那样 surface 不会被创建，而 VideoView 的
+                        // `openVideo()` 开头就是 `if (mSurfaceHolder == null) return;` ——
+                        // 视频永远不会开始解码，`onPrepared` 一次都不回调，数字人彻底不显示。
+                        // （这个坑实测踩过：改完整个数字人消失，只剩背景和控件。）
+                        //
+                        // 挪出屏幕则 surface 照常创建、视频照常解码，只是那块"还没有画面的黑"
+                        // 看不见；首帧渲染出来再挪回来。
+                        //
+                        // 起因：开机动画结束、主界面首次组合时，数字人的 surface 刚创建还是黑的，
+                        // 而它是**独立合成层、盖在所有 Compose 内容之上**，所以整个画面会黑掉。
+                        // 实测那段黑持续 0.47 秒（动画 05:27:28.325 结束 → 数字人 05:27:28.794 出首帧）。
+                        translationX = OFFSCREEN_X
+                        setOnInfoListener { _, what, _ ->
+                            if (what == MediaPlayer.MEDIA_INFO_VIDEO_RENDERING_START) {
+                                android.util.Log.d("XiaozhiClient", "[数字人] 首帧渲染，移回屏幕内")
+                                translationX = 0f
+                            }
+                            false
+                        }
                         setOnPreparedListener { player ->
                             player.isLooping = true
                             player.setVolume(0f, 0f)
@@ -1000,6 +1216,17 @@ private fun DigitalHumanPanel(state: UiState, modifier: Modifier = Modifier) {
                             // （旧写法在 onPrepared 里算一次绝对像素，客户机上出现过
                             //  数字人缩到屏幕三分之一且再也回不来的情况）。
                             setSourceSize(player.videoWidth, player.videoHeight)
+                            // 兜底：万一某台机器不回调 MEDIA_INFO_VIDEO_RENDERING_START，
+                            // 画面会一直停在屏幕外、数字人永远不出现。到点无论如何挪回来。
+                            postDelayed({
+                                if (translationX != 0f) {
+                                    android.util.Log.w(
+                                        "XiaozhiClient",
+                                        "[数字人] 未收到首帧回调，兜底移回屏幕内",
+                                    )
+                                    translationX = 0f
+                                }
+                            }, DIGITAL_HUMAN_FIRST_FRAME_FALLBACK_MS)
                         }
                     },
                     FrameLayout.LayoutParams(

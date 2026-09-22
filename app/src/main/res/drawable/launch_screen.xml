@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
   启动窗口背景：在 Compose 首帧渲染出来之前的这几秒里，
-  让用户看到品牌底 + 应用标记，而不是一片无信息的空白。
+  让用户看到品牌底 + 我们的「瓶中星」标记，而不是一片无信息的空白。
+
+  这里用位图而不是矢量：我们的 logo 是生成的位图（瓶子 + 星星，见
+  screen_docs/素材/品牌logo/）。五档密度都放了同一张图的对应尺寸，
+  所以任何屏幕密度下渲染出来的物理大小都是 240dp 高。
 -->
 <layer-list xmlns:android="http://schemas.android.com/apk/res/android">
     <item android:drawable="@color/launch_background" />
     <item
-        android:drawable="@drawable/ic_launcher_foreground"
+        android:drawable="@drawable/launch_logo"
         android:gravity="center" />
 </layer-list>
