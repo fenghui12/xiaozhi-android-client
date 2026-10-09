@@ -61,12 +61,25 @@ class XiaozhiRealtimeClient(private val okHttpClient: OkHttpClient) {
 
         normalizeToken(params.token)?.let { requestBuilder.header("Authorization", it) }
 
-        webSocket = okHttpClient.newWebSocket(
+        val socket = okHttpClient.newWebSocket(
             requestBuilder.build(),
             socketListener(),
         )
+        webSocket = socket
 
-        withTimeout(20_000) { handshakeDeferred.await() }
+        try {
+            withTimeout(20_000) { handshakeDeferred.await() }
+        } catch (error: Throwable) {
+            // 握手超时/失败时原先什么都不做：半开的 socket 留在 webSocket 字段里，
+            // 之后迟到的 hello 还会把状态改成"已连接"，而调用方已经按失败处理了。
+            // 这里主动放弃这个 socket（cancel 不等关闭握手），让监听器后续回调全部失效。
+            if (webSocket === socket) {
+                webSocket = null
+                sessionId = null
+            }
+            socket.cancel()
+            throw error
+        }
     }
 
     fun disconnect(notify: Boolean = true) {
@@ -185,6 +198,11 @@ class XiaozhiRealtimeClient(private val okHttpClient: OkHttpClient) {
             override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
                 if (this@XiaozhiRealtimeClient.webSocket != webSocket) {
                     return
+                }
+                // 回应服务端的关闭帧，否则连接要等 OkHttp 的超时才真正释放。
+                webSocket.close(1000, null)
+                if (!handshakeDeferred.isCompleted) {
+                    handshakeDeferred.completeExceptionally(IOException("握手期间服务端关闭连接: $code $reason"))
                 }
                 sessionId = null
                 this@XiaozhiRealtimeClient.webSocket = null

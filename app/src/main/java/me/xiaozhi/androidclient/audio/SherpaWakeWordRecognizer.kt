@@ -33,6 +33,10 @@ private const val KWS_DETECTION_COOLDOWN_MS = 2_500L
 private const val KWS_DEVICE_RECHECK_MS = 5_000L
 private const val KWS_RELEASE_BEFORE_CAPTURE_MS = 350L
 private const val KWS_REARM_RETRY_MS = 100L
+private const val KWS_START_RETRY_MS = 300L
+private const val KWS_FAILURE_RETRY_BASE_MS = 1_000L
+private const val KWS_FAILURE_RETRY_MAX_MS = 30_000L
+private const val KWS_EMPTY_READ_SLEEP_MS = 10L
 private const val KWS_KEYWORDS_SCORE = 3.0f
 private const val KWS_KEYWORDS_THRESHOLD = 0.25f
 private const val LOG_TAG = "XiaozhiClient"
@@ -68,6 +72,19 @@ class SherpaWakeWordRecognizer(
     /** 上一次复查输入设备的时刻。 */
     private var lastDeviceCheckAtMs: Long = 0L
 
+    /** 连续启动/录音失败次数，用于重试退避；成功读到音频后清零。 */
+    @Volatile
+    private var consecutiveFailures: Int = 0
+
+    // 固定的 Runnable 实例，stop() 才能把排队中的重启撤掉（方法引用每次都是新对象）。
+    private val rearmRunnable = Runnable { restartAfterIgnoredDetection() }
+    private val startRetryRunnable = Runnable {
+        val keywords = pendingStartKeywords ?: return@Runnable
+        pendingStartKeywords = null
+        startNormalized(keywords)
+    }
+    private var pendingStartKeywords: String? = null
+
     fun start(wakeWords: String) {
         if (released) {
             return
@@ -80,6 +97,13 @@ class SherpaWakeWordRecognizer(
             return
         }
 
+        startNormalized(keywords)
+    }
+
+    private fun startNormalized(keywords: String) {
+        if (released) {
+            return
+        }
         if (shouldListen && keywords == configuredKeywords) {
             return
         }
@@ -89,10 +113,15 @@ class SherpaWakeWordRecognizer(
         if (oldThread?.isAlive == true) {
             runCatching { oldThread.join(500) }
             if (oldThread.isAlive) {
+                // 旧线程还没退出（例如卡在 AudioRecord.read）。以前直接 return，
+                // 上层 LaunchedEffect 不会再调 start()，设备就一直停在“重启中”听不见。
                 publishStatus("离线唤醒重启中")
+                pendingStartKeywords = keywords
+                mainHandler.postDelayed(startRetryRunnable, KWS_START_RETRY_MS)
                 return
             }
         }
+        consecutiveFailures = 0
         configuredKeywords = keywords
         listeningRequested = true
         shouldListen = true
@@ -107,6 +136,9 @@ class SherpaWakeWordRecognizer(
     fun stop(updateStatus: Boolean = false) {
         listeningRequested = false
         shouldListen = false
+        pendingStartKeywords = null
+        mainHandler.removeCallbacks(startRetryRunnable)
+        mainHandler.removeCallbacks(rearmRunnable)
         runCatching { audioRecord?.stop() }
         if (updateStatus) {
             publishStatus("未启用")
@@ -124,10 +156,17 @@ class SherpaWakeWordRecognizer(
     }
 
     private fun runKwsLoop() {
-        val kws = ensureKeywordSpotter() ?: return
+        val kws = ensureKeywordSpotter() ?: run {
+            // 以前这里直接 return 且 shouldListen 仍为 true，界面停在“正在初始化”，
+            // 同样的唤醒词再调 start() 也会被短路，永远不会再试。
+            shouldListen = false
+            scheduleRestartAfterFailure()
+            return
+        }
         val record = createAudioRecord() ?: run {
             publishError("启动离线唤醒失败：无法初始化麦克风")
             shouldListen = false
+            scheduleRestartAfterFailure()
             return
         }
 
@@ -135,10 +174,12 @@ class SherpaWakeWordRecognizer(
             publishError("启动离线唤醒失败：${error.message.orEmpty()}")
             shouldListen = false
             releaseAudioRecord(record)
+            scheduleRestartAfterFailure()
             return
         }
 
         if (createdStream.ptr == 0L) {
+            // 唤醒词本身不可用，重试也没用，等用户改设置。
             publishError("启动离线唤醒失败：唤醒词格式不可用")
             shouldListen = false
             releaseAudioRecord(record)
@@ -155,6 +196,7 @@ class SherpaWakeWordRecognizer(
         stream = createdStream
         audioRecord = record
 
+        var failed = false
         try {
             record.startRecording()
             publishStatus("正在监听唤醒词")
@@ -162,6 +204,8 @@ class SherpaWakeWordRecognizer(
         } catch (error: Exception) {
             if (shouldListen && !released) {
                 publishError("离线唤醒异常：${error.message.orEmpty()}")
+                shouldListen = false
+                failed = true
             }
         } finally {
             releaseAudioRecord(record)
@@ -173,6 +217,18 @@ class SherpaWakeWordRecognizer(
                 recordingThread = null
             }
         }
+        if (failed) scheduleRestartAfterFailure()
+    }
+
+    /** 录音/初始化失败后按指数退避（1s→2s→…封顶 30s）自动重启，24 小时值守不能靠人工重启。 */
+    private fun scheduleRestartAfterFailure() {
+        if (released || !listeningRequested) return
+        val attempt = consecutiveFailures
+        consecutiveFailures = attempt + 1
+        val delayMs = minOf(KWS_FAILURE_RETRY_BASE_MS shl minOf(attempt, 5), KWS_FAILURE_RETRY_MAX_MS)
+        Log.w(LOG_TAG, "[KWS] 离线唤醒失败，${delayMs}ms 后重试（第 ${attempt + 1} 次）")
+        publishStatus("离线唤醒重试中")
+        mainHandler.postDelayed(rearmRunnable, delayMs)
     }
 
     private fun ensureKeywordSpotter(): KeywordSpotter? {
@@ -214,9 +270,17 @@ class SherpaWakeWordRecognizer(
 
         while (shouldListen && !released) {
             val read = record.read(buffer, 0, buffer.size)
-            if (read <= 0) {
+            if (read < 0) {
+                // ERROR_DEAD_OBJECT / ERROR_INVALID_OPERATION 等：录音已失效，
+                // 以前 `continue` 会让线程 100% 空转且再也收不到音频。交给外层重建。
+                if (!shouldListen || released) return
+                throw IllegalStateException("AudioRecord.read 返回 $read")
+            }
+            if (read == 0) {
+                Thread.sleep(KWS_EMPTY_READ_SLEEP_MS)
                 continue
             }
+            consecutiveFailures = 0
 
             // 监听期间定期复查输入设备：USB 麦克风可能在 App 启动之后才被系统枚举出来，
             // 而选择器只在"开录那一刻"看得到它。绑错了就在这里自愈。
@@ -288,7 +352,7 @@ class SherpaWakeWordRecognizer(
         }
         val oldThread = recordingThread
         if (oldThread?.isAlive == true) {
-            mainHandler.postDelayed(::restartAfterIgnoredDetection, KWS_REARM_RETRY_MS)
+            mainHandler.postDelayed(rearmRunnable, KWS_REARM_RETRY_MS)
             return
         }
         shouldListen = true
@@ -370,16 +434,14 @@ class SherpaWakeWordRecognizer(
     private fun recheckInputDevice(record: AudioRecord) {
         val current = boundInputDevice
         // 已经绑在真正的麦克风上了，不用管。
-        if (current != null && current.type != AudioDeviceInfo.TYPE_BUILTIN_MIC) return
-
-        val better = InputDeviceSelector.inputsOf(audioManager)
-            .firstOrNull(InputDeviceSelector::isUsbInput) ?: return
+        val better = InputDeviceSelector.preferredExternal(InputDeviceSelector.inputsOf(audioManager), audioManager) ?: return
+        if (current?.id == better.id) return
 
         runCatching { record.preferredDevice = better }
         boundInputDevice = better
         Log.w(
             LOG_TAG,
-            "[KWS] 之前绑在板载麦上（本机没有焊咪头，等于听不见），USB 麦克风出现后已自动切过去：" +
+            "[KWS] 输入设备变化，已自动切换麦克风：" +
                 "${better.productName} type=${better.type}",
         )
     }

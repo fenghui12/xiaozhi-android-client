@@ -111,6 +111,9 @@ class ReminderScheduler(
             dueAtEpochMs = System.currentTimeMillis() + seconds * 1_000L,
             checkCount = current.checkCount + 1,
             supervisionPhase = SupervisionPhase.VERIFICATION_SCHEDULED,
+            // 播报已完成（或核验已出结果），不再是“等待投递”；否则 UI 一直显示“等待连接后播报”，
+            // 重启后 start() 还会把它当成未播报的提醒再发一遍。
+            deliveryPending = false,
         )
         persist()
         onSnapshot(snapshot())
@@ -147,6 +150,11 @@ class ReminderScheduler(
         .firstOrNull { it.kind == ReminderKind.TIMER && it.deliveryPending }
         ?: reminders.values.firstOrNull { it.kind == ReminderKind.TIMER }
 
+    /** 按 id 取监督任务。多任务并存时核验流程必须按身份确认，不能依赖 [activeSupervision] 的优先级。 */
+    @Synchronized
+    fun supervision(reminderId: String): ScheduledReminder? =
+        reminders[reminderId]?.takeIf { it.kind == ReminderKind.SUPERVISION }
+
     @Synchronized
     fun snapshot(): List<ScheduledReminder> = reminders.values.toList()
 
@@ -169,29 +177,33 @@ class ReminderScheduler(
             reminders.values.filter { it.dueAtEpochMs != null && now >= it.dueAtEpochMs }
         }
         due.forEach { reminder ->
-            val shouldDeliver = synchronized(this) {
-                val current = reminders[reminder.id] ?: return@synchronized false
+            // 必须把**推进后**的任务交给 onDue：以前传的是推进前的快照，核验到点时
+            // VM 看到的仍是 VERIFICATION_SCHEDULED，于是又发一遍【监督】而不是调摄像头。
+            val updated = synchronized(this) {
+                val current = reminders[reminder.id] ?: return@synchronized null
                 if (current.dueAtEpochMs == null || System.currentTimeMillis() < current.dueAtEpochMs) {
-                    return@synchronized false
+                    return@synchronized null
                 }
-                if (current.kind == ReminderKind.TIMER) {
-                    reminders[current.id] = current.copy(
+                val next = if (current.kind == ReminderKind.TIMER) {
+                    current.copy(
                         dueAtEpochMs = null,
                         deliveryPending = true,
                     )
                 } else {
                     val nextPhase = SupervisionPolicy.phaseWhenDue(current.supervisionPhase)
-                        ?: return@synchronized false
-                    reminders[current.id] = current.copy(
+                        ?: return@synchronized null
+                    current.copy(
                         dueAtEpochMs = null,
                         supervisionPhase = nextPhase,
-                        deliveryPending = true,
+                        // 只有需要开口播报的阶段才算“等待投递”；VERIFYING 是设备自己拍照。
+                        deliveryPending = nextPhase == SupervisionPhase.WAITING_FOR_ACK,
                     )
                 }
+                reminders[next.id] = next
                 persist()
-                true
+                next
             }
-            if (shouldDeliver) onDue(reminder)
+            if (updated != null) onDue(updated)
         }
     }
 
@@ -245,9 +257,12 @@ class ReminderScheduler(
             var normalizedDueAt = if (kind == ReminderKind.TIMER && deliveryPending) {
                 System.currentTimeMillis()
             } else dueAt
+            var normalizedPending = deliveryPending
             if (phase == SupervisionPhase.VERIFYING) {
                 phase = SupervisionPhase.VERIFICATION_SCHEDULED
                 normalizedDueAt = System.currentTimeMillis()
+                // 旧版本会把 VERIFYING 也存成 deliveryPending=true，重启后 start() 会误发【监督】。
+                normalizedPending = false
             }
             val reminder = ScheduledReminder(
                 id = item.optString("id"),
@@ -256,7 +271,7 @@ class ReminderScheduler(
                 dueAtEpochMs = normalizedDueAt,
                 checkCount = checkCount,
                 supervisionPhase = phase,
-                deliveryPending = deliveryPending,
+                deliveryPending = normalizedPending,
             )
             if (reminder.id.isNotBlank() && reminder.message.isNotBlank()) reminders[reminder.id] = reminder
         }

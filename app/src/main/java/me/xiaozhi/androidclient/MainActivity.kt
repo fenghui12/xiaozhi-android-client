@@ -324,6 +324,20 @@ private fun XiaozhiApp() {
         pendingAudioAction = null
     }
 
+    // 运行时权限：唤醒词是这台设备唯一的启动方式，v1.2.7 删掉手动麦克风键后，
+    // release 构建里再没有任何地方申请 RECORD_AUDIO / CAMERA，新装机器会一直聋、看不见且不报错。
+    // 所以启动时统一申请一次，并在回到前台时重新检查（用户可能去系统设置里手动授予）。
+    val hasPermission: (String) -> Boolean = { permission ->
+        ContextCompat.checkSelfPermission(context, permission) == PackageManager.PERMISSION_GRANTED
+    }
+    var microphoneGranted by remember { mutableStateOf(hasPermission(Manifest.permission.RECORD_AUDIO)) }
+    val startupPermissionLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.RequestMultiplePermissions(),
+    ) {
+        microphoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO)
+        if (!microphoneGranted) viewModel.onMicrophonePermissionDenied("startup")
+    }
+
     val avatarPickerLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent(),
     ) { uri ->
@@ -355,6 +369,7 @@ private fun XiaozhiApp() {
             when (event) {
                 Lifecycle.Event.ON_START -> {
                     isForeground = true
+                    microphoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO)
                     viewModel.refreshPythonRuntimeStatus()
                 }
 
@@ -375,6 +390,9 @@ private fun XiaozhiApp() {
 
     LaunchedEffect(Unit) {
         viewModel.refreshPythonRuntimeStatus()
+        val missing = listOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+            .filterNot(hasPermission)
+        if (missing.isNotEmpty()) startupPermissionLauncher.launch(missing.toTypedArray())
     }
 
     LaunchedEffect(state.isAssistantSpeaking) {
@@ -397,8 +415,10 @@ private fun XiaozhiApp() {
         state.isSilentTransportRecovery,
         playbackCooldownActive,
         isForeground,
+        microphoneGranted,
     ) {
         val shouldRun = isForeground &&
+            microphoneGranted &&
             state.wakeWordEnabled &&
             !state.isRecording &&
             !state.isAssistantSpeaking &&

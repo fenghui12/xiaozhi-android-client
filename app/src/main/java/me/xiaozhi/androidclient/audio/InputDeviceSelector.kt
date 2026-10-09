@@ -35,6 +35,21 @@ import android.util.Log
  */
 object InputDeviceSelector {
 
+    private val identities = java.util.concurrent.ConcurrentHashMap<String, UsbAudioIdentity>()
+
+    fun invalidateIdentities() {
+        identities.clear()
+    }
+
+    private fun usbIdentity(address: String): UsbAudioIdentity? {
+        identities[address]?.let { return it }
+        val card = Regex("^card=(\\d+);device=\\d+;?$").matchEntire(address)?.groupValues?.get(1) ?: return null
+        return runCatching {
+            val parts = java.io.File("/proc/asound/card$card/usbid").readText().trim().split(':')
+            UsbAudioIdentity(parts[0].toInt(16), parts[1].toInt(16)).also { identities[address] = it }
+        }.getOrNull()
+    }
+
     private const val TAG = "XiaozhiClient"
 
     /** 找不到 USB/有线麦时，最多等它出现这么久。 */
@@ -48,6 +63,20 @@ object InputDeviceSelector {
         else -> false
     }
 
+    fun endpoint(device: AudioDeviceInfo): AudioEndpoint = AudioEndpoint(
+        name = device.productName.toString(),
+        address = device.address,
+        usb = isUsbInput(device),
+        identity = if (isUsbInput(device)) usbIdentity(device.address) else null,
+    )
+
+    fun integratedOutput(manager: AudioManager, input: AudioDeviceInfo?): AudioDeviceInfo? {
+        val outputs = manager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
+        val selected = AudioHardwareProfilePolicy.pairedOutput(input?.let(::endpoint), outputs.map(::endpoint))
+            ?: return null
+        return outputs.firstOrNull { endpoint(it) == selected }
+    }
+
     fun isWiredInput(device: AudioDeviceInfo): Boolean = when (device.type) {
         AudioDeviceInfo.TYPE_WIRED_HEADSET, AudioDeviceInfo.TYPE_USB_HEADSET -> true
         else -> false
@@ -59,6 +88,11 @@ object InputDeviceSelector {
         } else {
             emptyList()
         }
+
+    fun preferredExternal(devices: List<AudioDeviceInfo>, manager: AudioManager): AudioDeviceInfo? =
+        devices.firstOrNull { integratedOutput(manager, it) != null }
+            ?: devices.firstOrNull(::isUsbInput)
+            ?: devices.firstOrNull(::isWiredInput)
 
     /**
      * 选输入设备，**会为 USB 麦短暂等待**。只能在后台线程调用。
@@ -82,7 +116,7 @@ object InputDeviceSelector {
             return builtin ?: devices.firstOrNull(::isUsbInput) ?: devices.first()
         }
 
-        val immediate = devices.firstOrNull(::isUsbInput) ?: devices.firstOrNull(::isWiredInput)
+        val immediate = preferredExternal(devices, manager)
         if (immediate != null) return immediate
 
         // 走到这里说明"这一刻"没有 USB/有线麦。它很可能只是还没枚举完 —— 等一会儿再看。
@@ -90,7 +124,7 @@ object InputDeviceSelector {
         while (SystemClock.elapsedRealtime() - startedAt < waitMs) {
             SystemClock.sleep(POLL_STEP_MS)
             val again = inputsOf(manager)
-            val found = again.firstOrNull(::isUsbInput) ?: again.firstOrNull(::isWiredInput)
+            val found = preferredExternal(again, manager)
             if (found != null) {
                 Log.d(
                     TAG,
@@ -134,7 +168,7 @@ data class AudioInputHealth(
     val message: String
         get() = when {
             externalMicPresent -> "麦克风：$label"
-            onlyBuiltin -> "没有检测到摄像头麦克风，请检查摄像头的 USB 连接"
+            onlyBuiltin -> "没有检测到外接麦克风，请检查 USB 音频连接"
             else -> "没有检测到任何麦克风"
         }
 }
@@ -144,7 +178,7 @@ data class AudioInputHealth(
  */
 fun InputDeviceSelector.health(manager: AudioManager, preferBuiltin: Boolean): AudioInputHealth {
     val devices = inputsOf(manager)
-    val external = devices.firstOrNull(::isUsbInput) ?: devices.firstOrNull(::isWiredInput)
+    val external = preferredExternal(devices, manager)
     val builtin = devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_MIC }
     val chosen = if (preferBuiltin) builtin ?: external else external ?: builtin
     return AudioInputHealth(

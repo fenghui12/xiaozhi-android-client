@@ -20,6 +20,7 @@ import io.github.jaredmdobson.concentus.OpusEncoder
 import io.github.jaredmdobson.concentus.OpusException
 import java.io.File
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -35,6 +36,7 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import me.xiaozhi.androidclient.model.ListeningMode
 
 private const val INPUT_SAMPLE_RATE = 16000
@@ -65,17 +67,23 @@ class XiaozhiAudioEngine(context: Context) {
     private val playbackScope = CoroutineScope(SupervisorJob() + playbackDispatcher)
     private val playbackMutex = Mutex()
     private val captureMutex = Mutex()
+    private val playbackReference = java.util.ArrayDeque<Double>()
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+            InputDeviceSelector.invalidateIdentities()
+            refreshPreferredOutput()
             refreshAudioRouteStatus()
         }
 
         override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+            InputDeviceSelector.invalidateIdentities()
+            refreshPreferredOutput()
             refreshAudioRouteStatus()
         }
     }
 
     private var captureJob: Job? = null
+    @Volatile
     private var audioTrack: AudioTrack? = null
     private var decoder: OpusDecoder? = null
     private var streamSampleRate: Int = DEFAULT_OUTPUT_SAMPLE_RATE
@@ -89,13 +97,13 @@ class XiaozhiAudioEngine(context: Context) {
     private var debugLoggingEnabled: Boolean = false
     private var debugWavDumpEnabled: Boolean = false
     private var lastRouteStatus: String = DEFAULT_AUDIO_ROUTE
+    private var lastHardwareProfile: AudioHardwareProfile? = null
     private var deviceCallbackRegistered: Boolean = false
     private var debugWavWriter: PcmWavWriter? = null
     private var playbackFrameCount: Int = 0
     private var lastPlaybackPeak: Int = 0
     private var lastPlaybackGain: Float = 1.0f
     private var smoothedPlaybackGain: Float = 1.0f
-    private var playbackStarted: Boolean = false
     private var maxPlaybackPeak: Int = 0
     private var playbackPeakTotal: Long = 0
     private var lowPeakPlaybackFrames: Int = 0
@@ -104,7 +112,17 @@ class XiaozhiAudioEngine(context: Context) {
     @Volatile
     private var isCaptureRunning: Boolean = false
 
+    // 播放闸门：clearPlayback() 关闸并让代数 +1，beginPlaybackSession()（即 tts start）才重新开闸。
+    // - 关闸后到达的迟到帧直接丢弃：否则被打断那一轮的残余音频会把 isAssistantSpeaking
+    //   重新置 true，而后面不一定还有 tts stop 来把它拉回 false，唤醒词就一直起不来。
+    // - 代数用来丢掉清空前已经排进 playbackScope 的积压帧，打断能立刻生效，
+    //   不用等积压队列逐帧解码写完。
+    @Volatile
+    private var playbackGateOpen: Boolean = true
+    private val playbackEpoch = AtomicInteger(0)
+
     init {
+        InputDeviceSelector.invalidateIdentities()
         playbackSampleRate = resolvePlaybackSampleRate()
         decoderSampleRate = resolveDecoderSampleRate(playbackSampleRate)
         registerDeviceCallback()
@@ -151,17 +169,28 @@ class XiaozhiAudioEngine(context: Context) {
     }
 
     fun beginPlaybackSession() {
+        playbackGateOpen = true
+        // 计数器只在播放线程上、持锁修改：原先在主线程直接改，会和正在写帧的播放线程互相踩。
+        // playbackScope 是单线程 + 公平锁，排在这之后的帧一定看到重置后的状态。
+        playbackScope.launch {
+            playbackMutex.withLock {
+                resetPlaybackCountersLocked()
+                closeDebugWavWriter()
+                refreshAudioRouteStatus()
+            }
+        }
+    }
+
+    private fun resetPlaybackCountersLocked() {
+        synchronized(playbackReference) { playbackReference.clear() }
         playbackFrameCount = 0
         lastPlaybackPeak = 0
         lastPlaybackGain = 1.0f
         smoothedPlaybackGain = 1.0f
-        playbackStarted = false
         maxPlaybackPeak = 0
         playbackPeakTotal = 0
         lowPeakPlaybackFrames = 0
         playbackFramesWritten = 0
-        closeDebugWavWriter()
-        refreshAudioRouteStatus()
     }
 
     fun startCapture(
@@ -170,6 +199,7 @@ class XiaozhiAudioEngine(context: Context) {
         onAutoStop: () -> Unit,
         onRecordingChanged: (Boolean) -> Unit,
         onError: (String) -> Unit,
+        onSpeechDuringPlayback: (List<ByteArray>) -> Unit = {},
     ) {
         if (captureJob != null) {
             return
@@ -207,6 +237,14 @@ class XiaozhiAudioEngine(context: Context) {
                 val encodedBuffer = ByteArray(MAX_OPUS_PACKET_BYTES)
                 var speechDetected = mode != ListeningMode.AUTO
                 var silenceFrames = 0
+                val bargeInDetector = LocalBargeInDetector()
+                val preRoll = java.util.ArrayDeque<ByteArray>()
+                var captureDeviceId = audioRecord.preferredDevice?.id
+                val captureDump = if (debugWavDumpEnabled) runCatching {
+                    val directory = File(appContext.cacheDir, "audio-debug").apply { mkdirs() }
+                    PcmWavWriter(File(directory, "last_capture.wav"), INPUT_SAMPLE_RATE, 1)
+                }.getOrNull() else null
+                var captureDumpFrames = 0
 
                 try {
                     audioRecord.startRecording()
@@ -230,6 +268,16 @@ class XiaozhiAudioEngine(context: Context) {
                                 pcmFrame[index] = 0
                             }
                         }
+                        if (captureDumpFrames < 1_000) {
+                            runCatching { captureDump?.write(pcmFrame) }
+                            captureDumpFrames += 1
+                        }
+
+                        val preferredInput = findPreferredInputDevice()
+                        if (preferredInput != null && preferredInput.id != captureDeviceId) {
+                            audioRecord.setPreferredDevice(preferredInput)
+                            captureDeviceId = preferredInput.id
+                        }
 
                         if (mode == ListeningMode.AUTO) {
                             val rms = calculateRms(pcmFrame)
@@ -250,11 +298,20 @@ class XiaozhiAudioEngine(context: Context) {
                             encodedBuffer.size,
                         )
                         if (encodedSize > 0) {
-                            val sent = onEncodedFrame(encodedBuffer.copyOf(encodedSize))
+                            val encodedFrame = encodedBuffer.copyOf(encodedSize)
+                            if (bargeInDetector.process(pcmFrame, playbackEpoch.get(), canInterruptPlayback(audioRecord), recentPlaybackRms())) {
+                                withContext(Dispatchers.Main.immediate) {
+                                    onSpeechDuringPlayback(preRoll.toList())
+                                }
+                                preRoll.clear()
+                            }
+                            val sent = onEncodedFrame(encodedFrame)
                             if (!sent) {
                                 onError("发送编码后的音频帧失败")
                                 break
                             }
+                            preRoll.addLast(encodedFrame)
+                            while (preRoll.size > 8) preRoll.removeFirst()
                         }
 
                         if (mode == ListeningMode.AUTO && speechDetected && silenceFrames >= AUTO_STOP_SILENCE_FRAMES) {
@@ -265,6 +322,7 @@ class XiaozhiAudioEngine(context: Context) {
                 } catch (error: Exception) {
                     onError("录音失败：${error.message.orEmpty()}")
                 } finally {
+                    runCatching { captureDump?.close() }
                     releaseAudioEffects()
                     try {
                         audioRecord.stop()
@@ -294,8 +352,15 @@ class XiaozhiAudioEngine(context: Context) {
         onPlaybackChanged: (Boolean) -> Unit,
         onError: (String) -> Unit,
     ) {
+        if (!playbackGateOpen) {
+            return
+        }
+        val epoch = playbackEpoch.get()
         playbackScope.launch {
             playbackMutex.withLock {
+                if (epoch != playbackEpoch.get()) {
+                    return@withLock
+                }
                 try {
                     val frameSize = decoderSampleRate * decoderFrameDurationMs / 1000
                     val outputRate = playbackSampleRate
@@ -325,8 +390,17 @@ class XiaozhiAudioEngine(context: Context) {
                         outputSampleRate = outputRate,
                     )
                     val inputPeak = measurePeak(resampledBuffer)
-                    val gain = computePlaybackGain(inputPeak)
+                    val gain = if (preferredHardwareProfile() == AudioHardwareProfile.YUNDEA_INTEGRATED) {
+                        1.0f
+                    } else {
+                        computePlaybackGain(inputPeak)
+                    }
                     val boostedBuffer = applyGain(resampledBuffer, gain)
+                    val referenceRms = kotlin.math.sqrt(boostedBuffer.sumOf { it.toDouble() * it.toDouble() } / max(1, boostedBuffer.size))
+                    synchronized(playbackReference) {
+                        playbackReference.addLast(referenceRms)
+                        while (playbackReference.size > 12) playbackReference.removeFirst()
+                    }
                     val stereoBuffer = monoToStereo(boostedBuffer)
                     ensureDebugWavWriter(outputRate)
                     debugWavWriter?.write(stereoBuffer)
@@ -338,18 +412,32 @@ class XiaozhiAudioEngine(context: Context) {
                     if (inputPeak < MIN_DYNAMIC_GAIN_PEAK) {
                         lowPeakPlaybackFrames += 1
                     }
-                    if (!playbackStarted && playbackFrameCount >= PLAYBACK_START_THRESHOLD_FRAMES) {
+                    // 以 AudioTrack 的真实状态为准决定要不要 play()，不再用单独的 playbackStarted 标志：
+                    // 原先 clearPlayback()/释放重建后标志仍为 true，新帧就阻塞写进一个没在播放的 track，
+                    // 缓冲一满永远卡住，而且卡住时还攥着 playbackMutex——之后的清空、收尾全部排不上，
+                    // 设备从此没声音，isAssistantSpeaking 也回不到 false。
+                    // 预缓冲帧数（PLAYBACK_START_THRESHOLD_FRAMES）远小于缓冲容量，起播前的写入不会阻塞。
+                    if (
+                        playbackFrameCount >= PLAYBACK_START_THRESHOLD_FRAMES &&
+                        track.playState != AudioTrack.PLAYSTATE_PLAYING
+                    ) {
                         track.play()
-                        playbackStarted = true
                     }
-                    track.write(stereoBuffer, 0, stereoBuffer.size, AudioTrack.WRITE_BLOCKING)
-                    playbackFramesWritten += stereoBuffer.size / 2L
+                    val written = track.write(stereoBuffer, 0, stereoBuffer.size, AudioTrack.WRITE_BLOCKING)
+                    if (written < 0) {
+                        // ERROR_DEAD_OBJECT 等：音频服务重启、USB 喇叭重插后旧 track 就作废了，
+                        // 不重建的话之后每一帧都写失败、永久静音，而且以前连日志都没有。
+                        onError("音频播放失败：AudioTrack.write=$written，已重建播放器")
+                        releasePlaybackLocked()
+                        return@withLock
+                    }
+                    playbackFramesWritten += written / 2L
                     if (playbackFrameCount == 1) {
                         emitDebug(
                             "audio_playback: stream=${streamSampleRate}Hz decoder=${decoderSampleRate}Hz output=${outputRate}Hz frame=$decodedSamples peak=$inputPeak gain=${"%.2f".format(gain)}",
                         )
                     }
-                    if (playbackStarted) {
+                    if (playbackGateOpen && epoch == playbackEpoch.get() && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                         onPlaybackChanged(true)
                     }
                 } catch (error: Exception) {
@@ -361,14 +449,16 @@ class XiaozhiAudioEngine(context: Context) {
     }
 
     fun finishPlayback(onPlaybackChanged: (Boolean) -> Unit = {}) {
+        val epoch = playbackEpoch.get()
         playbackScope.launch {
             playbackMutex.withLock {
+                if (!playbackGateOpen || epoch != playbackEpoch.get()) return@withLock
                 audioTrack?.let { track ->
                     try {
                         if (playbackFrameCount > 0 && track.playState != AudioTrack.PLAYSTATE_PLAYING) {
                             track.play()
                         }
-                        waitForPlaybackDrain(track)
+                        waitForPlaybackDrain(track, epoch)
                         track.pause()
                         track.flush()
                     } catch (_: IllegalStateException) {
@@ -383,6 +473,10 @@ class XiaozhiAudioEngine(context: Context) {
     }
 
     fun clearPlayback(onPlaybackChanged: (Boolean) -> Unit = {}) {
+        playbackGateOpen = false
+        playbackEpoch.incrementAndGet()
+        runCatching { audioTrack?.pause() }
+        runCatching { audioTrack?.flush() }
         playbackScope.launch {
             playbackMutex.withLock {
                 audioTrack?.let { track ->
@@ -393,6 +487,7 @@ class XiaozhiAudioEngine(context: Context) {
                     }
                 }
                 emitPlaybackSummary()
+                resetPlaybackCountersLocked()
                 closeDebugWavWriter()
                 onPlaybackChanged(false)
                 refreshAudioRouteStatus()
@@ -508,7 +603,7 @@ class XiaozhiAudioEngine(context: Context) {
                 AudioAttributes.SPATIALIZATION_BEHAVIOR_NEVER,
             )
         }
-        return AudioTrack.Builder()
+        val track = AudioTrack.Builder()
             .setAudioAttributes(attributesBuilder.build())
             .setAudioFormat(
                 AudioFormat.Builder()
@@ -520,7 +615,35 @@ class XiaozhiAudioEngine(context: Context) {
             .setTransferMode(AudioTrack.MODE_STREAM)
             .setBufferSizeInBytes(bufferSize)
             .build()
+        findIntegratedOutputDevice()?.let { device ->
+            Log.d("XiaozhiClient", "[PLAYBACK] preferred output=${device.productName} address=${device.address} accepted=${track.setPreferredDevice(device)}")
+        }
+        return track
     }
+
+    private fun canInterruptPlayback(record: AudioRecord): Boolean {
+        val track = audioTrack ?: return false
+        if (!playbackGateOpen || track.playState != AudioTrack.PLAYSTATE_PLAYING) return false
+        val input = record.routedDevice ?: return false
+        val output = track.routedDevice ?: return false
+        return AudioHardwareProfilePolicy.resolve(InputDeviceSelector.endpoint(input), InputDeviceSelector.endpoint(output))
+            .supportsLocalBargeIn
+    }
+
+    private fun findIntegratedOutputDevice(): AudioDeviceInfo? =
+        InputDeviceSelector.integratedOutput(audioManager, findPreferredInputDevice())
+
+    private fun preferredHardwareProfile(): AudioHardwareProfile = AudioHardwareProfilePolicy.resolve(
+        findPreferredInputDevice()?.let(InputDeviceSelector::endpoint),
+        findIntegratedOutputDevice()?.let(InputDeviceSelector::endpoint),
+    )
+
+    private fun refreshPreferredOutput() {
+        runCatching { audioTrack?.setPreferredDevice(findIntegratedOutputDevice()) }
+    }
+
+    private fun recentPlaybackRms(): Double =
+        synchronized(playbackReference) { playbackReference.maxOrNull() ?: 0.0 }
 
     private fun releasePlaybackLocked() {
         try {
@@ -548,8 +671,13 @@ class XiaozhiAudioEngine(context: Context) {
     }
 
     private fun refreshAudioRouteStatus() {
+        val profile = preferredHardwareProfile()
+        if (lastHardwareProfile != profile) {
+            lastHardwareProfile = profile
+            Log.d("XiaozhiClient", "[AUDIO_PROFILE] $profile localBargeIn=${profile.supportsLocalBargeIn}")
+        }
         publishRouteStatus(
-            "媒体输出：${describeOutputDevice(findPreferredOutputDevice())} / 输入：${describeInputDevice(findPreferredInputDevice())}",
+            "${profile.label} · 媒体输出：${describeOutputDevice(findPreferredOutputDevice())} / 输入：${describeInputDevice(findPreferredInputDevice())}",
         )
     }
 
@@ -571,7 +699,7 @@ class XiaozhiAudioEngine(context: Context) {
             return null
         }
         val devices = audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS)
-        return devices.firstOrNull(::isBluetoothMediaOutputDevice)
+        return findIntegratedOutputDevice() ?: devices.firstOrNull(::isBluetoothMediaOutputDevice)
             ?: devices.firstOrNull(::isWiredOutputDevice)
             ?: devices.firstOrNull(::isSpeakerDevice)
             ?: devices.firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
@@ -581,6 +709,7 @@ class XiaozhiAudioEngine(context: Context) {
     private fun describeOutputDevice(device: AudioDeviceInfo?): String {
         return when {
             device == null -> "扬声器"
+            UsbEchoCancellationPolicy.isSupportedDevice(device.productName.toString()) -> device.productName.toString()
             isBluetoothMediaOutputDevice(device) -> "蓝牙耳机"
             device.type == AudioDeviceInfo.TYPE_USB_HEADSET -> "USB 耳机"
             isWiredOutputDevice(device) -> "有线耳机"
@@ -593,6 +722,7 @@ class XiaozhiAudioEngine(context: Context) {
     private fun describeInputDevice(device: AudioDeviceInfo?): String {
         return when {
             device == null -> "机身麦克风"
+            UsbEchoCancellationPolicy.isSupportedDevice(device.productName.toString()) -> device.productName.toString()
             isBluetoothInputDevice(device) -> "蓝牙麦克风"
             isUsbInputDevice(device) -> "USB 麦克风"
             isWiredInputDevice(device) -> "耳机麦克风"
@@ -790,9 +920,10 @@ class XiaozhiAudioEngine(context: Context) {
         )
     }
 
-    private suspend fun waitForPlaybackDrain(track: AudioTrack) {
+    private suspend fun waitForPlaybackDrain(track: AudioTrack, epoch: Int) {
         val deadlineMs = System.currentTimeMillis() + 1_500L
         while (System.currentTimeMillis() < deadlineMs) {
+            if (!playbackGateOpen || epoch != playbackEpoch.get()) break
             val remainingFrames = playbackFramesWritten - track.playbackHeadPosition.toLong()
             if (remainingFrames <= 0L) {
                 break

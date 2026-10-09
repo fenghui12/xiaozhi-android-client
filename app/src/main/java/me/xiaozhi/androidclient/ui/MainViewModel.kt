@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
+import kotlin.math.min
 import me.xiaozhi.androidclient.audio.XiaozhiAudioEngine
 import me.xiaozhi.androidclient.camera.CameraVisionTool
 import me.xiaozhi.androidclient.data.AppPreferences
@@ -81,6 +82,7 @@ private const val AUTO_START_DELAY_MS = 600L
 private const val ACTIVATION_POLL_INTERVAL_MS = 4_000L
 private const val ACTIVATION_POLL_MAX_ATTEMPTS = 90
 private const val AUTO_RECONNECT_DELAY_MS = 1_500L
+private const val MAX_RECONNECT_DELAY_MS = 30_000L
 private const val GOODBYE_DISCONNECT_WINDOW_MS = 5_000L
 private const val REMINDER_LISTENING_GRACE_MS = 3_000L
 private const val REMINDER_CURRENT_TURN_GRACE_MS = 5_000L
@@ -159,6 +161,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     private var pendingWakePhrase: String? = null
     private var activationPollingJob: Job? = null
     private var reconnectJob: Job? = null
+    private var reconnectAttempts = 0
     private var goodbyeDisconnectWindowJob: Job? = null
     private var scheduledDeliveryJob: Job? = null
     private var supervisionVerificationJob: Job? = null
@@ -1162,6 +1165,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 )
             }
             persist()
+        } else if (reason == "startup") {
+            // 不关 wakeWordEnabled、不落盘：授权后回到前台会自动恢复监听。
+            updateState { copy(wakeWordStatus = "需要麦克风权限") }
         }
     }
 
@@ -1226,6 +1232,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     connect()
                 } else {
                     addLog("OTA 返回中没有 WebSocket 配置")
+                    abandonPendingConversation("OTA 未下发 WebSocket 配置")
                 }
 
                 if (result.activation != null && websocketConfig == null) {
@@ -1260,6 +1267,8 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 if (canUseCachedConfig) {
                     addLog("OTA 暂不可用，改用本地缓存配置连接服务端")
                     connect()
+                } else {
+                    abandonPendingConversation("获取 OTA 配置失败")
                 }
             }
         }
@@ -1553,15 +1562,18 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (state.websocketUrl.isBlank()) {
             addLog("WebSocket 地址为空，请先获取官方配置")
             updateState { copy(connectionStatus = ConnectionStatus.FAILED) }
+            abandonPendingConversation("WebSocket 地址为空")
             return
         }
         if (protocolVersion == null) {
             addLog("协议版本必须是整数")
             updateState { copy(connectionStatus = ConnectionStatus.FAILED) }
+            abandonPendingConversation("协议版本无效")
             return
         }
         if (state.activationPending) {
             addLog("设备还没有完成激活")
+            abandonPendingConversation("设备未激活")
             return
         }
 
@@ -1609,6 +1621,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
                 addLog("连接失败：${error.message.orEmpty()}")
+                // 握手超时/DNS/TLS 失败不会产生 Error 事件，以前停在 FAILED 就再也不重连了。
+                finishScheduledDelivery("连接失败，等待重试", requeue = true)
+                abandonPendingConversation("连接失败")
+                scheduleReconnect("连接失败")
             }
         }
     }
@@ -1665,6 +1681,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
         audioEngine.startCapture(
             mode = mode,
+            onSpeechDuringPlayback = { preRoll ->
+                if (uiState.value.isAssistantSpeaking && uiState.value.connectionStatus == ConnectionStatus.CONNECTED) {
+                    conversationLoopActive = true
+                    scheduledResumeCancelledByUser = true
+                    ignoreLifecycleGoodbyeAfterScheduledDelivery = false
+                    audioEngine.clearPlayback()
+                    updateState { copy(isAssistantSpeaking = false, isTurnActive = true) }
+                    realtimeClient.sendAbort("user_abort")
+                    realtimeClient.sendStartListening(ListeningMode.REALTIME)
+                    preRoll.forEach(realtimeClient::sendAudioFrame)
+                    setNanoState("LISTENING")
+                    addLog("本地语音打断：已停止播报并继续聆听，保留 ${preRoll.size * 60}ms 插话音频")
+                }
+            },
             onEncodedFrame = { frame ->
                 val state = uiState.value
                 // 这里**不能**再用 state.isRecording 当条件：本地静音检测自动停录时走的是
@@ -1893,8 +1923,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     private fun startSupervisionVerification(reminder: ScheduledReminder) {
-        val current = reminderScheduler.activeSupervision()
-        if (current?.id != reminder.id || current.supervisionPhase != SupervisionPhase.VERIFYING) {
+        // 多个监督任务并存时 activeSupervision() 优先返回“等待播报”的那一个，按 id 确认才可靠。
+        val current = reminderScheduler.supervision(reminder.id)
+        if (current == null || current.supervisionPhase != SupervisionPhase.VERIFYING) {
             addLog("忽略已失效的监督核验：${reminder.message}")
             return
         }
@@ -1921,7 +1952,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
      * 已被取消或换掉，所以**进入时还要再确认一次任务身份**，不能只信排出时的相位快照。
      */
     private suspend fun runSupervisionVerification(reminder: ScheduledReminder) {
-        if (reminderScheduler.activeSupervision()?.id != reminder.id) {
+        if (reminderScheduler.supervision(reminder.id) == null) {
             addLog("排队的监督核验已失效，跳过：${reminder.message}")
             return
         }
@@ -1936,7 +1967,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         result.getOrNull()?.let { response ->
             addLog("监督视觉返回：${response.replace('\n', ' ').take(160)}")
         }
-        if (reminderScheduler.activeSupervision()?.id != reminder.id) {
+        if (reminderScheduler.supervision(reminder.id) == null) {
             addLog("监督任务已变化，丢弃本次摄像头结果")
             return
         }
@@ -2239,6 +2270,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
             is XiaozhiRealtimeClient.RealtimeEvent.Connected -> {
                 cancelReconnect()
+                reconnectAttempts = 0
                 cancelExpectedGoodbyeDisconnect()
                 audioEngine.configurePlayback(
                     sampleRate = event.hello.sampleRate,
@@ -2655,9 +2687,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         if (reconnectJob?.isActive == true) {
             return
         }
+        // 连续失败时指数退避（1.5s→3s→…封顶 30s），避免断网时每 1.5s 打一次服务端；连上后清零。
+        val effectiveDelayMs = if (delayMs > 0L) {
+            min(delayMs shl min(reconnectAttempts, 5), MAX_RECONNECT_DELAY_MS)
+        } else {
+            0L
+        }
+        reconnectAttempts++
         reconnectJob = viewModelScope.launch {
-            addLog("$reason，稍后自动重连")
-            delay(delayMs)
+            addLog("$reason，${effectiveDelayMs / 1000.0}s 后自动重连")
+            delay(effectiveDelayMs)
             val status = uiState.value.connectionStatus
             if (!userRequestedDisconnect &&
                 status != ConnectionStatus.CONNECTED &&
@@ -2741,6 +2780,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         pendingWakePhrase = null
         pendingTextPrompts.clear()
         updateState { copy(isTurnActive = false) }
+    }
+
+    /**
+     * 唤醒后在"连上服务端之前"就失败（OTA 失败、未激活、握手失败）时调用。
+     * 否则 isTurnActive 会一直停在 true，之后所有唤醒词都被当成"会话未结束"忽略。
+     */
+    private fun abandonPendingConversation(reason: String) {
+        val hadPending = pendingWakePhrase != null || pendingListeningMode != null || pendingTextPrompts.isNotEmpty()
+        val state = uiState.value
+        if (!hadPending && !(state.isTurnActive && !state.isRecording && !state.isAssistantSpeaking)) {
+            return
+        }
+        conversationLoopActive = false
+        clearPendingConversation()
+        if (state.wakeWordStatus.startsWith("已唤醒")) {
+            updateState { copy(wakeWordStatus = WAKE_WORD_STANDBY) }
+        }
+        setNanoState("IDLE")
+        addLog("$reason，已取消排队中的对话")
     }
 
     private fun clearRoleConversation() {
