@@ -13,6 +13,7 @@ import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.NoiseSuppressor
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import io.github.jaredmdobson.concentus.OpusApplication
 import io.github.jaredmdobson.concentus.OpusDecoder
@@ -20,7 +21,6 @@ import io.github.jaredmdobson.concentus.OpusEncoder
 import io.github.jaredmdobson.concentus.OpusException
 import java.io.File
 import java.util.concurrent.Executors
-import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.abs
 import kotlin.math.max
 import kotlin.math.min
@@ -117,9 +117,7 @@ class XiaozhiAudioEngine(context: Context) {
     //   重新置 true，而后面不一定还有 tts stop 来把它拉回 false，唤醒词就一直起不来。
     // - 代数用来丢掉清空前已经排进 playbackScope 的积压帧，打断能立刻生效，
     //   不用等积压队列逐帧解码写完。
-    @Volatile
-    private var playbackGateOpen: Boolean = true
-    private val playbackEpoch = AtomicInteger(0)
+    private val playbackSession = PlaybackSessionState()
 
     init {
         InputDeviceSelector.invalidateIdentities()
@@ -169,11 +167,18 @@ class XiaozhiAudioEngine(context: Context) {
     }
 
     fun beginPlaybackSession() {
-        playbackGateOpen = true
+        val epoch = playbackSession.begin()
         // 计数器只在播放线程上、持锁修改：原先在主线程直接改，会和正在写帧的播放线程互相踩。
         // playbackScope 是单线程 + 公平锁，排在这之后的帧一定看到重置后的状态。
         playbackScope.launch {
             playbackMutex.withLock {
+                if (!playbackSession.isCurrent(epoch)) return@withLock
+                audioTrack?.let { track ->
+                    runCatching {
+                        track.pause()
+                        track.flush()
+                    }
+                }
                 resetPlaybackCountersLocked()
                 closeDebugWavWriter()
                 refreshAudioRouteStatus()
@@ -299,7 +304,7 @@ class XiaozhiAudioEngine(context: Context) {
                         )
                         if (encodedSize > 0) {
                             val encodedFrame = encodedBuffer.copyOf(encodedSize)
-                            if (bargeInDetector.process(pcmFrame, playbackEpoch.get(), canInterruptPlayback(audioRecord), recentPlaybackRms())) {
+                            if (bargeInDetector.process(pcmFrame, playbackSession.epoch, canInterruptPlayback(audioRecord), recentPlaybackRms())) {
                                 withContext(Dispatchers.Main.immediate) {
                                     onSpeechDuringPlayback(preRoll.toList())
                                 }
@@ -352,13 +357,10 @@ class XiaozhiAudioEngine(context: Context) {
         onPlaybackChanged: (Boolean) -> Unit,
         onError: (String) -> Unit,
     ) {
-        if (!playbackGateOpen) {
-            return
-        }
-        val epoch = playbackEpoch.get()
+        val epoch = playbackSession.frameEpoch() ?: return
         playbackScope.launch {
             playbackMutex.withLock {
-                if (epoch != playbackEpoch.get()) {
+                if (!playbackSession.isCurrent(epoch)) {
                     return@withLock
                 }
                 try {
@@ -423,21 +425,25 @@ class XiaozhiAudioEngine(context: Context) {
                     ) {
                         track.play()
                     }
-                    val written = track.write(stereoBuffer, 0, stereoBuffer.size, AudioTrack.WRITE_BLOCKING)
-                    if (written < 0) {
-                        // ERROR_DEAD_OBJECT 等：音频服务重启、USB 喇叭重插后旧 track 就作废了，
-                        // 不重建的话之后每一帧都写失败、永久静音，而且以前连日志都没有。
-                        onError("音频播放失败：AudioTrack.write=$written，已重建播放器")
-                        releasePlaybackLocked()
-                        return@withLock
+                    var offset = 0
+                    while (offset < stereoBuffer.size && playbackSession.isCurrent(epoch)) {
+                        val written = track.write(stereoBuffer, offset, stereoBuffer.size - offset, AudioTrack.WRITE_BLOCKING)
+                        if (written <= 0) {
+                            // ERROR_DEAD_OBJECT 等：音频服务重启、USB 喇叭重插后旧 track 就作废了，
+                            // 不重建的话之后每一帧都写失败、永久静音，而且以前连日志都没有。
+                            onError("音频播放失败：AudioTrack.write=$written，已重建播放器")
+                            releasePlaybackLocked()
+                            return@withLock
+                        }
+                        offset += written
+                        playbackFramesWritten += written / 2L
                     }
-                    playbackFramesWritten += written / 2L
                     if (playbackFrameCount == 1) {
                         emitDebug(
                             "audio_playback: stream=${streamSampleRate}Hz decoder=${decoderSampleRate}Hz output=${outputRate}Hz frame=$decodedSamples peak=$inputPeak gain=${"%.2f".format(gain)}",
                         )
                     }
-                    if (playbackGateOpen && epoch == playbackEpoch.get() && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
+                    if (playbackSession.isCurrent(epoch) && track.playState == AudioTrack.PLAYSTATE_PLAYING) {
                         onPlaybackChanged(true)
                     }
                 } catch (error: Exception) {
@@ -449,21 +455,30 @@ class XiaozhiAudioEngine(context: Context) {
     }
 
     fun finishPlayback(onPlaybackChanged: (Boolean) -> Unit = {}) {
-        val epoch = playbackEpoch.get()
+        val epoch = playbackSession.finish() ?: run {
+            onPlaybackChanged(false)
+            return
+        }
         playbackScope.launch {
             playbackMutex.withLock {
-                if (!playbackGateOpen || epoch != playbackEpoch.get()) return@withLock
+                if (playbackSession.isFinished(epoch)) {
+                    onPlaybackChanged(false)
+                    return@withLock
+                }
+                if (!playbackSession.isCurrent(epoch)) return@withLock
                 audioTrack?.let { track ->
                     try {
                         if (playbackFrameCount > 0 && track.playState != AudioTrack.PLAYSTATE_PLAYING) {
                             track.play()
                         }
                         waitForPlaybackDrain(track, epoch)
+                        if (!playbackSession.isCurrent(epoch)) return@withLock
                         track.pause()
                         track.flush()
                     } catch (_: IllegalStateException) {
                     }
                 }
+                if (!playbackSession.complete(epoch)) return@withLock
                 emitPlaybackSummary()
                 closeDebugWavWriter()
                 onPlaybackChanged(false)
@@ -473,12 +488,12 @@ class XiaozhiAudioEngine(context: Context) {
     }
 
     fun clearPlayback(onPlaybackChanged: (Boolean) -> Unit = {}) {
-        playbackGateOpen = false
-        playbackEpoch.incrementAndGet()
+        val epoch = playbackSession.interrupt()
         runCatching { audioTrack?.pause() }
         runCatching { audioTrack?.flush() }
         playbackScope.launch {
             playbackMutex.withLock {
+                if (epoch != playbackSession.epoch) return@withLock
                 audioTrack?.let { track ->
                     try {
                         track.pause()
@@ -623,7 +638,7 @@ class XiaozhiAudioEngine(context: Context) {
 
     private fun canInterruptPlayback(record: AudioRecord): Boolean {
         val track = audioTrack ?: return false
-        if (!playbackGateOpen || track.playState != AudioTrack.PLAYSTATE_PLAYING) return false
+        if (!playbackSession.isActive || track.playState != AudioTrack.PLAYSTATE_PLAYING) return false
         val input = record.routedDevice ?: return false
         val output = track.routedDevice ?: return false
         return AudioHardwareProfilePolicy.resolve(InputDeviceSelector.endpoint(input), InputDeviceSelector.endpoint(output))
@@ -921,15 +936,21 @@ class XiaozhiAudioEngine(context: Context) {
     }
 
     private suspend fun waitForPlaybackDrain(track: AudioTrack, epoch: Int) {
-        val deadlineMs = System.currentTimeMillis() + 1_500L
-        while (System.currentTimeMillis() < deadlineMs) {
-            if (!playbackGateOpen || epoch != playbackEpoch.get()) break
-            val remainingFrames = playbackFramesWritten - track.playbackHeadPosition.toLong()
+        val pendingFrames = (playbackFramesWritten - Integer.toUnsignedLong(track.playbackHeadPosition)).coerceAtLeast(0L)
+        val deadlineMs = SystemClock.elapsedRealtime() + pendingFrames * 1_000L / playbackSampleRate + 1_500L
+        while (SystemClock.elapsedRealtime() < deadlineMs) {
+            if (!playbackSession.isCurrent(epoch)) break
+            val remainingFrames = playbackFramesWritten - Integer.toUnsignedLong(track.playbackHeadPosition)
             if (remainingFrames <= 0L) {
                 break
             }
             delay(12)
         }
+        val head = Integer.toUnsignedLong(track.playbackHeadPosition)
+        Log.d(
+            "XiaozhiClient",
+            "[PLAYBACK] drain epoch=$epoch written=$playbackFramesWritten head=$head remaining=${(playbackFramesWritten - head).coerceAtLeast(0L)} active=${playbackSession.isCurrent(epoch)} underruns=${track.underrunCount}",
+        )
     }
 
     private fun emitDebug(message: String) {

@@ -152,6 +152,7 @@ data class UiState(
     val termuxApiStatus: String = "",
     val debugLoggingEnabled: Boolean = false,
     val debugWavDumpEnabled: Boolean = false,
+    val nanoGpioEnabled: Boolean = false,
     val connectionStatus: ConnectionStatus = ConnectionStatus.DISCONNECTED,
     val isSilentTransportRecovery: Boolean = false,
     val draftMessage: String = "",

@@ -32,6 +32,7 @@ private const val KEY_TERMUX_API_COMMAND = "termux_api_command"
 private const val KEY_TERMUX_API_ARGUMENTS = "termux_api_arguments"
 private const val KEY_DEBUG_LOGGING_ENABLED = "debug_logging_enabled"
 private const val KEY_DEBUG_WAV_DUMP_ENABLED = "debug_wav_dump_enabled"
+private const val KEY_NANO_GPIO_ENABLED = "nano_gpio_enabled"
 
 const val DEFAULT_OTA_URL: String = "https://api.tenclass.net/xiaozhi/ota/"
 const val DEFAULT_PROTOCOL_VERSION: String = "1"
@@ -67,6 +68,7 @@ data class StoredConfig(
     val termuxApiArguments: String,
     val debugLoggingEnabled: Boolean,
     val debugWavDumpEnabled: Boolean,
+    val nanoGpioEnabled: Boolean,
 )
 
 class AppPreferences(private val context: Context) {
@@ -111,6 +113,7 @@ class AppPreferences(private val context: Context) {
             termuxApiArguments = prefs.getString(KEY_TERMUX_API_ARGUMENTS, "") ?: "",
             debugLoggingEnabled = prefs.getBoolean(KEY_DEBUG_LOGGING_ENABLED, false),
             debugWavDumpEnabled = prefs.getBoolean(KEY_DEBUG_WAV_DUMP_ENABLED, false),
+            nanoGpioEnabled = prefs.getBoolean(KEY_NANO_GPIO_ENABLED, false),
         )
     }
 
@@ -141,6 +144,7 @@ class AppPreferences(private val context: Context) {
             .putString(KEY_TERMUX_API_ARGUMENTS, config.termuxApiArguments)
             .putBoolean(KEY_DEBUG_LOGGING_ENABLED, config.debugLoggingEnabled)
             .putBoolean(KEY_DEBUG_WAV_DUMP_ENABLED, config.debugWavDumpEnabled)
+            .putBoolean(KEY_NANO_GPIO_ENABLED, config.nanoGpioEnabled)
             .apply()
     }
 

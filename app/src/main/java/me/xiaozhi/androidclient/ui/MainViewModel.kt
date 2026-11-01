@@ -2,6 +2,7 @@ package me.xiaozhi.androidclient.ui
 
 import android.app.Application
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -24,6 +25,7 @@ import kotlinx.coroutines.withContext
 import kotlin.math.min
 import me.xiaozhi.androidclient.audio.XiaozhiAudioEngine
 import me.xiaozhi.androidclient.camera.CameraVisionTool
+import me.xiaozhi.androidclient.camera.PersonPresenceDetector
 import me.xiaozhi.androidclient.data.AppPreferences
 import me.xiaozhi.androidclient.data.RoleProfileRepository
 import me.xiaozhi.androidclient.data.StoredConfig
@@ -31,7 +33,10 @@ import me.xiaozhi.androidclient.util.ImageSampling
 import me.xiaozhi.androidclient.integration.TermuxCommandEvents
 import me.xiaozhi.androidclient.integration.TermuxCommandResult
 import me.xiaozhi.androidclient.integration.TermuxRunner
+import me.xiaozhi.androidclient.integration.DdrFrequencyLock
+import me.xiaozhi.androidclient.integration.NanoGpioBridge
 import me.xiaozhi.androidclient.integration.NanoSerialBridge
+import me.xiaozhi.androidclient.integration.PresenceGate
 import me.xiaozhi.androidclient.mcp.McpCameraServer
 import me.xiaozhi.androidclient.model.ActivationInfo
 import me.xiaozhi.androidclient.model.ChatMessage
@@ -88,6 +93,7 @@ private const val REMINDER_LISTENING_GRACE_MS = 3_000L
 private const val REMINDER_CURRENT_TURN_GRACE_MS = 5_000L
 private const val REMINDER_SEND_RETRY_MS = 1_500L
 private const val ACTIVE_GREETING_CODE_PHRASE = "【主动招呼】"
+private const val PRESENCE_TICK_MS = 500L
 private const val TIMER_CODE_PHRASE = "【定时提醒】"
 private const val SUPERVISION_START_CODE_PHRASE = "【监督提醒】"
 private const val SUPERVISION_RESULT_CODE_PHRASE = "【监督结果】"
@@ -216,12 +222,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     private val _uiState = MutableStateFlow(loadInitialState())
     val uiState = _uiState.asStateFlow()
+    /** 旧硬件（冯姐那台）：Nano 经 RS232 转 TTL 接 ttyS4/ttyS3，始终开启。 */
     private val nanoSerialBridge by lazy {
         NanoSerialBridge(
             onLineReceived = ::handleNanoLine,
             onStatus = ::addLog,
         )
     }
+
+    /** 新硬件：Nano 两根线直连 J35 IO6/IO7，需在设置里打开；关闭时为 null。只在主线程访问。 */
+    private var nanoGpioBridge: NanoGpioBridge? = null
+
+    /** 主动招呼二重判断：超声波拉低 IO6 之后，还要摄像头看到人。只在主线程访问。 */
+    private var presenceGate = PresenceGate()
+    private val personPresenceDetector by lazy { PersonPresenceDetector(cameraVisionTool) }
     // Construct the scheduler only after queues and UI state are initialized.
     // Restored tasks can be due immediately and invoke this ViewModel during startup.
     private val reminderScheduler = ReminderScheduler(
@@ -266,7 +280,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         addLog("客户端已就绪")
         addLog("当前使用未烧录设备接入模式")
+        DdrFrequencyLock.apply { message -> viewModelScope.launch { addLog(message) } }
         nanoSerialBridge.start()
+        if (storedConfig.nanoGpioEnabled) {
+            startNanoGpio()
+        }
+        startPresenceWatch()
         reminderScheduler.start()
         viewModelScope.launch {
             delay(AUTO_START_DELAY_MS)
@@ -2180,8 +2199,42 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         cancelExpectedGoodbyeDisconnect()
         realtimeClient.disconnect(notify = false)
         nanoSerialBridge.close()
+        nanoGpioBridge?.close()
         audioEngine.release()
         super.onCleared()
+    }
+
+    fun updateNanoGpioEnabled(enabled: Boolean) {
+        if (enabled == uiState.value.nanoGpioEnabled) {
+            return
+        }
+        updateAndPersist { copy(nanoGpioEnabled = enabled) }
+        if (enabled) {
+            startNanoGpio()
+        } else {
+            nanoGpioBridge?.close()
+            nanoGpioBridge = null
+            presenceGate = PresenceGate()
+            addLog("已关闭 Nano GPIO 直连")
+        }
+    }
+
+    private fun startNanoGpio() {
+        if (nanoGpioBridge != null) {
+            return
+        }
+        presenceGate = PresenceGate()
+        lateinit var bridge: NanoGpioBridge
+        bridge = NanoGpioBridge(
+            onEventLineChanged = { low ->
+                // 关掉又打开时旧线程可能还在收尾，丢掉旧实例的回调
+                viewModelScope.launch { if (nanoGpioBridge === bridge) handleNanoEventLine(low) }
+            },
+            onStatus = { message -> viewModelScope.launch { addLog(message) } },
+        )
+        nanoGpioBridge = bridge
+        bridge.setDeviceState(lastNanoState)
+        bridge.start()
     }
 
     private fun handleNanoLine(rawLine: String) {
@@ -2190,7 +2243,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             when {
                 line.startsWith("PERSON_NEAR,") -> {
                     val distanceMm = line.substringAfter(',').toIntOrNull()
-                    handlePersonNear(distanceMm)
+                    val distanceLabel = distanceMm?.let { "（${it}mm）" }.orEmpty()
+                    if (!handlePersonNear("检测到人持续靠近$distanceLabel，触发主动招呼和摄像头分析")) {
+                        nanoSerialBridge.sendLine("EVENT_REJECTED")
+                    }
                 }
 
                 line.startsWith("NANO_READY,") -> {
@@ -2204,12 +2260,50 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun handlePersonNear(distanceMm: Int?) {
+    private fun handleNanoEventLine(low: Boolean) {
+        val wasActive = presenceGate.isEpisodeActive
+        presenceGate.onLineChanged(low, SystemClock.elapsedRealtime())
+        when {
+            low && presenceGate.isEpisodeActive -> addLog("超声波检测到物体靠近，等待摄像头确认是否为人")
+            !low && wasActive -> addLog("靠近物体已离开，主动招呼重新待命")
+        }
+    }
+
+    private fun startPresenceWatch() {
+        viewModelScope.launch {
+            while (true) {
+                delay(PRESENCE_TICK_MS)
+                val state = uiState.value
+                val appIdle = !state.isRecording && !state.isAssistantSpeaking && !state.isTurnActive
+                presenceGate.tick(SystemClock.elapsedRealtime(), appIdle)?.let(::runPresenceAction)
+            }
+        }
+    }
+
+    private fun runPresenceAction(action: PresenceGate.Action) {
+        when (action) {
+            PresenceGate.Action.CheckCamera -> viewModelScope.launch {
+                val result = personPresenceDetector.check()
+                addLog("主动招呼确认：${result.detail}")
+                val verdict = when {
+                    !result.cameraAvailable -> PresenceGate.Verdict.CAMERA_UNAVAILABLE
+                    result.personFound -> PresenceGate.Verdict.PERSON
+                    else -> PresenceGate.Verdict.NO_PERSON
+                }
+                presenceGate.onCheckResult(verdict, SystemClock.elapsedRealtime())?.let(::runPresenceAction)
+            }
+
+            PresenceGate.Action.Greet -> handlePersonNear("超声波＋摄像头均确认有人，触发主动招呼")
+            is PresenceGate.Action.GiveUp -> addLog(action.reason)
+        }
+    }
+
+    /** 返回 false 表示当前会话未结束、本次没有触发。 */
+    private fun handlePersonNear(logMessage: String): Boolean {
         val state = uiState.value
         if (state.isRecording || state.isAssistantSpeaking || state.isTurnActive) {
-            nanoSerialBridge.sendLine("EVENT_REJECTED")
             addLog("检测到人靠近，但当前会话未结束，本次不触发")
-            return
+            return false
         }
 
         conversationLoopActive = true
@@ -2221,9 +2315,9 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 wakeWordStatus = "检测到人靠近",
             )
         }
-        val distanceLabel = distanceMm?.let { "（${it}mm）" }.orEmpty()
-        addLog("检测到人持续靠近$distanceLabel，触发主动招呼和摄像头分析")
+        addLog(logMessage)
         ensureReadyForConversation(trigger = "主动招呼")
+        return true
     }
 
     private fun setNanoState(state: String) {
@@ -2232,6 +2326,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         lastNanoState = state
         nanoSerialBridge.setDeviceState(state)
+        nanoGpioBridge?.setDeviceState(state)
     }
 
     private fun finishListening(
@@ -2314,7 +2409,16 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 val wasSpeaking = uiState.value.isAssistantSpeaking
                 conversationLoopActive = false
                 finishListening(sendStop = false, stopCapture = true, keepTurnActive = false, reason = "Socket 已关闭")
-                audioEngine.clearPlayback { isPlaying ->
+                updateState {
+                    copy(
+                        connectionStatus = ConnectionStatus.DISCONNECTED,
+                        sessionId = "",
+                        isAssistantSpeaking = wasSpeaking,
+                        isTurnActive = wasSpeaking,
+                        isSilentTransportRecovery = recoverSilently,
+                    )
+                }
+                audioEngine.finishPlayback { isPlaying ->
                     updateState {
                         copy(
                             isAssistantSpeaking = isPlaying,
@@ -2324,15 +2428,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     if (!isPlaying) {
                         setNanoState("IDLE")
                     }
-                }
-                updateState {
-                    copy(
-                        connectionStatus = ConnectionStatus.DISCONNECTED,
-                        sessionId = "",
-                        isAssistantSpeaking = wasSpeaking,
-                        isTurnActive = wasSpeaking,
-                        isSilentTransportRecovery = recoverSilently,
-                    )
                 }
                 addLog("Socket 已关闭：${event.code} ${event.reason}")
                 scheduleReconnect(
@@ -2344,21 +2439,22 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             is XiaozhiRealtimeClient.RealtimeEvent.Error -> {
                 cancelExpectedGoodbyeDisconnect()
                 finishScheduledDelivery("实时通道异常，等待重试", requeue = true)
+                val wasSpeaking = uiState.value.isAssistantSpeaking
                 conversationLoopActive = false
                 finishListening(sendStop = false, stopCapture = true, keepTurnActive = false, reason = "实时通道异常")
-                audioEngine.clearPlayback {
-                    updateState { copy(isAssistantSpeaking = it) }
-                }
                 updateState {
                     copy(
                         connectionStatus = ConnectionStatus.FAILED,
-                        isAssistantSpeaking = false,
-                        isTurnActive = false,
+                        isAssistantSpeaking = wasSpeaking,
+                        isTurnActive = wasSpeaking,
                         isSilentTransportRecovery = false,
                     )
                 }
+                audioEngine.finishPlayback { isPlaying ->
+                    updateState { copy(isAssistantSpeaking = isPlaying, isTurnActive = isPlaying) }
+                    if (!isPlaying) setNanoState("IDLE")
+                }
                 addLog(event.message)
-                setNanoState("IDLE")
                 scheduleReconnect("实时通道异常")
             }
         }
@@ -2895,6 +2991,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             termuxApiStatus = termuxRunner.termuxApiStatusLabel(storedConfig.termuxEnabled),
             debugLoggingEnabled = storedConfig.debugLoggingEnabled,
             debugWavDumpEnabled = storedConfig.debugWavDumpEnabled,
+            nanoGpioEnabled = storedConfig.nanoGpioEnabled,
         )
     }
 
@@ -2926,6 +3023,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 termuxApiArguments = uiState.value.termuxApiArguments,
                 debugLoggingEnabled = uiState.value.debugLoggingEnabled,
                 debugWavDumpEnabled = uiState.value.debugWavDumpEnabled,
+                nanoGpioEnabled = uiState.value.nanoGpioEnabled,
             ),
         )
     }

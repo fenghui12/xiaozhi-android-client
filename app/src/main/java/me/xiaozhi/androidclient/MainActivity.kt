@@ -532,6 +532,7 @@ private fun XiaozhiApp() {
         onDeleteRole = viewModel::deleteRole,
         onCheckForUpdate = viewModel::checkForAppUpdate,
         onStartUpdate = viewModel::startDownloadAndInstallUpdate,
+        onNanoGpioEnabledChanged = viewModel::updateNanoGpioEnabled,
         onStartUpload = { roleId, target ->
             latestState.roleProfiles.firstOrNull { it.id == roleId }?.let { role ->
                 runCatching {
@@ -640,6 +641,7 @@ private fun XiaozhiScreen(
     onDeleteRole: (String) -> Unit,
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
+    onNanoGpioEnabledChanged: (Boolean) -> Unit,
     onStartUpload: (String, UploadTarget) -> Unit,
     onAbortSpeaking: () -> Unit,
     onClearRoleAvatar: (String) -> Unit,
@@ -753,6 +755,7 @@ private fun XiaozhiScreen(
                         onDeleteRole = onDeleteRole,
                         onCheckForUpdate = onCheckForUpdate,
                         onStartUpdate = onStartUpdate,
+                        onNanoGpioEnabledChanged = onNanoGpioEnabledChanged,
                         onStartUpload = onStartUpload,
                         onClearRoleAvatar = onClearRoleAvatar,
                         onClearRolePortrait = onClearRolePortrait,
@@ -1479,6 +1482,7 @@ private fun SettingsScreen(
     onDeleteRole: (String) -> Unit,
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
+    onNanoGpioEnabledChanged: (Boolean) -> Unit,
     onStartUpload: (String, UploadTarget) -> Unit,
     onClearRoleAvatar: (String) -> Unit,
     onClearRolePortrait: (String) -> Unit,
@@ -1509,6 +1513,16 @@ private fun SettingsScreen(
             onUpdateRole = onUpdateRole,
             onDeleteRole = onDeleteRole,
         )
+
+        SettingsCard {
+            SettingsSwitch(
+                icon = "🔌",
+                title = "Nano GPIO 直连",
+                subtitle = "Nano 两根线接 J35 IO6/IO7 时打开；走 RS232 串口的旧接法保持关闭",
+                checked = state.nanoGpioEnabled,
+                onCheckedChange = onNanoGpioEnabledChanged,
+            )
+        }
 
         AppUpdateCard(
             state = state,

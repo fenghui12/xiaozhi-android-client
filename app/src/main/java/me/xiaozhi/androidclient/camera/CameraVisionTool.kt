@@ -25,6 +25,8 @@ import java.io.IOException
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
@@ -60,6 +62,13 @@ class CameraVisionTool(
     @Volatile
     private var visionEndpoint: VisionEndpoint? = null
 
+    /**
+     * 同一时间只能有一个调用方开相机（USB 摄像头不支持多开，撞车会抛 CAMERA_IN_USE）。
+     * 用户主动提问走 [takePhotoAndExplain]，会排队等锁；
+     * 主动招呼前的确认走 [capturePresenceFrame]，拿不到锁就直接放弃，绝不卡住用户的问题。
+     */
+    private val cameraMutex = Mutex()
+
     fun updateVisionEndpoint(url: String?, token: String?) {
         visionEndpoint = url?.takeIf { it.isNotBlank() }?.let {
             VisionEndpoint(url = it, token = token.orEmpty())
@@ -73,8 +82,26 @@ class CameraVisionTool(
         val endpoint = requireNotNull(visionEndpoint) {
             "Vision upload endpoint has not been provided by the server"
         }
-        val jpeg = captureJpeg()
+        val jpeg = cameraMutex.withLock { captureJpeg(CAMERA_CAPTURE_TIMEOUT_MS) }
         return uploadForExplanation(endpoint, question, jpeg)
+    }
+
+    /**
+     * 主动招呼前拍一帧（已转正）用于本地人体确认，不上传。
+     * 相机正被占用时返回 null；超时、无权限、无摄像头时抛异常。
+     */
+    suspend fun capturePresenceFrame(timeoutMs: Long): ByteArray? {
+        require(ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            "Android camera permission is not granted"
+        }
+        if (!cameraMutex.tryLock()) {
+            return null
+        }
+        try {
+            return captureJpeg(timeoutMs)
+        } finally {
+            cameraMutex.unlock()
+        }
     }
 
     private suspend fun uploadForExplanation(
@@ -144,7 +171,7 @@ class CameraVisionTool(
     }
 
     @SuppressLint("MissingPermission")
-    private suspend fun captureJpeg(): ByteArray = suspendCancellableCoroutine { continuation ->
+    private suspend fun captureJpeg(timeoutMs: Long): ByteArray = suspendCancellableCoroutine { continuation ->
         val cameraManager = context.getSystemService(CameraManager::class.java)
         val cameraId = try {
             selectCameraId(cameraManager)
@@ -200,9 +227,9 @@ class CameraVisionTool(
         }, handler)
 
         val timeout = Runnable {
-            complete(Result.failure(IOException("Camera capture timed out after ${CAMERA_CAPTURE_TIMEOUT_MS}ms")))
+            complete(Result.failure(IOException("Camera capture timed out after ${timeoutMs}ms")))
         }
-        handler.postDelayed(timeout, CAMERA_CAPTURE_TIMEOUT_MS)
+        handler.postDelayed(timeout, timeoutMs)
 
         continuation.invokeOnCancellation {
             handler.removeCallbacks(timeout)

@@ -20,8 +20,8 @@ android {
         applicationId = "me.xiaozhi.androidclient"
         minSdk = 26
         targetSdk = 34
-        versionCode = 15
-        versionName = "1.2.11"
+        versionCode = 16
+        versionName = "1.2.12"
     }
 
     signingConfigs {
