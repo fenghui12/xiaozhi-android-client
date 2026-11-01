@@ -20,8 +20,12 @@ android {
         applicationId = "me.xiaozhi.androidclient"
         minSdk = 26
         targetSdk = 34
-        versionCode = 16
-        versionName = "1.2.12"
+        versionCode = 17
+        versionName = "1.2.13"
+        // 本机调试接口（127.0.0.1:8898）默认只在 debug 构建里有。debug 包签名不同，装到板子上
+        // 要先卸载、会丢数据，所以上板验收界面时用 `-PdebugServer=true` 打一个带接口的 release 包。
+        // 对外发版的包绝不能带这个参数。
+        buildConfigField("boolean", "DEBUG_SERVER", (findProperty("debugServer") == "true").toString())
     }
 
     signingConfigs {

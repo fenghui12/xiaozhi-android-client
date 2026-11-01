@@ -1,11 +1,9 @@
 package me.xiaozhi.androidclient.ui.theme
 
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Shapes
 import androidx.compose.material3.Typography
-import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.graphics.Color
@@ -15,66 +13,42 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-// 配色从原来的「鸢尾紫 + 兰花紫」换成一套冷静的品牌蓝。
-// 原方案在真机上偏灰紫、控件和背景互相抢，看着像未完成的默认主题。
-private val Brand = Color(0xFF3E7BFA)
-private val BrandSoft = Color(0xFFDCE8FF)
-private val BrandDeep = Color(0xFF1E4FB8)
-private val Teal = Color(0xFF3FA2B8)
-private val Mint = Color(0xFF3F8F7A)
-private val Paper = Color(0xFFF1F5FA)
-private val Stone = Color(0xFFE3EAF3)
-private val Ink = Color(0xFF16202E)
-private val Night = Color(0xFF10161F)
+// 配色：2026-11 前端改版定为「奶油杏底 + 珊瑚橙」的暖调陪伴风（效果图见
+// 项目情况/前端改版效果图_2026-11-02/），替换原来偏工具感的冷调品牌蓝。
+private val Brand = Color(0xFFFF7F50)
+private val BrandSoft = Color(0xFFFFE6D9)
+private val BrandDeep = Color(0xFFB4471F)
+private val Mist = Color(0xFF6F98C4)
+private val Mint = Color(0xFF4FB38A)
+private val Paper = Color(0xFFFFF6EE)
+private val Sand = Color(0xFFF6E9DE)
+private val Ink = Color(0xFF4A3426)
 
 private val LightColors = lightColorScheme(
     primary = Brand,
     onPrimary = Color.White,
     primaryContainer = BrandSoft,
     onPrimaryContainer = BrandDeep,
-    secondary = Teal,
+    secondary = Mist,
     onSecondary = Color.White,
-    secondaryContainer = Color(0xFFD8EEF4),
-    onSecondaryContainer = Color(0xFF10404C),
+    secondaryContainer = Color(0xFFE3EDF8),
+    onSecondaryContainer = Color(0xFF233A55),
     tertiary = Mint,
     onTertiary = Color.White,
-    tertiaryContainer = Color(0xFFD9F1EA),
-    onTertiaryContainer = Color(0xFF123B34),
+    tertiaryContainer = Color(0xFFDDF3E8),
+    onTertiaryContainer = Color(0xFF14402F),
     background = Paper,
     onBackground = Ink,
     surface = Color.White,
     onSurface = Ink,
-    surfaceVariant = Stone,
-    onSurfaceVariant = Color(0xFF566173),
-    error = Color(0xFFBA1A1A),
+    surfaceVariant = Sand,
+    onSurfaceVariant = Color(0xFF8C7466),
+    outline = Color(0xFFE2CFC1),
+    outlineVariant = Color(0xFFF1E2D6),
+    error = Color(0xFFD9442B),
     onError = Color.White,
-    errorContainer = Color(0xFFFFDAD6),
-    onErrorContainer = Color(0xFF410002),
-)
-
-private val DarkColors = darkColorScheme(
-    primary = Color(0xFFD0BCFF),
-    onPrimary = Color(0xFF381E72),
-    primaryContainer = Color(0xFF4F378B),
-    onPrimaryContainer = Color(0xFFEADDFF),
-    secondary = Color(0xFFE1BEE7),
-    onSecondary = Color(0xFF43224C),
-    secondaryContainer = Color(0xFF5B3865),
-    onSecondaryContainer = Color(0xFFF8D8FF),
-    tertiary = Color(0xFFA9D5CB),
-    onTertiary = Color(0xFF123B34),
-    tertiaryContainer = Color(0xFF2B524A),
-    onTertiaryContainer = Color(0xFFD9F1EA),
-    background = Night,
-    onBackground = Color(0xFFEAE0F2),
-    surface = Color(0xFF201A29),
-    onSurface = Color(0xFFEAE0F2),
-    surfaceVariant = Color(0xFF4A4458),
-    onSurfaceVariant = Color(0xFFCBC3D8),
-    error = Color(0xFFFFB4AB),
-    onError = Color(0xFF690005),
-    errorContainer = Color(0xFF93000A),
-    onErrorContainer = Color(0xFFFFDAD6),
+    errorContainer = Color(0xFFFFE1D9),
+    onErrorContainer = Color(0xFF5A1406),
 )
 
 private val AppShapes = Shapes(
@@ -127,7 +101,7 @@ private val AppTypography = Typography(
 @Composable
 fun XiaozhiClientTheme(content: @Composable () -> Unit) {
     MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) DarkColors else LightColors,
+        colorScheme = LightColors,
         typography = AppTypography,
         shapes = AppShapes,
         content = content,

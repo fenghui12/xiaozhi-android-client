@@ -16,13 +16,23 @@ import android.graphics.BitmapFactory
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.material.icons.filled.AutoAwesome
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.foundation.border
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.draw.clip
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -54,7 +64,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.Send
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ChatBubbleOutline
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Science
+import androidx.compose.material.icons.filled.Headphones
+import androidx.compose.material.icons.filled.Description
+import androidx.compose.material.icons.filled.RecordVoiceOver
+import androidx.compose.material.icons.filled.Cable
+import androidx.compose.material.icons.filled.MicOff
+import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Wifi
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Visibility
@@ -93,10 +112,12 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.res.colorResource
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.ui.text.font.FontWeight
@@ -147,21 +168,21 @@ private sealed interface PendingAudioAction {
     data class StartListening(val mode: ListeningMode) : PendingAudioAction
 }
 
-// 配色：原方案是「淡紫底 + 亮绿气泡」，饱和度互相打架，看着像开发默认主题。
-// 换成一套冷调、低饱和、层级清楚的方案——底浅、卡片白、用户气泡用一个明确的品牌蓝。
-private val ChatBackground = Color(0xFFF1F5FA)
-private val SettingsBackground = Color(0xFFF1F5FA)
-private val UserBubble = Color(0xFF3E7BFA)
-private val AssistantBubble = Color.White
-private val HeaderTint = Color(0xFFE8F0FC)
-private val BrandAccent = Color(0xFF3E7BFA)
-private val BrandAccentSoft = Color(0xFFDCE8FF)
+// 配色：2026-11 改版换成暖色（奶油底 + 珊瑚橙 + 暖棕字），与吉祥物小狮子和效果图统一。
+// 之前的冷蓝方案用户反馈「粗糙、土、没质感」。具体色值集中在 WarmUi.kt 的 [Warm]。
+private val ChatBackground = Warm.Paper
+private val SettingsBackground = Warm.Paper
+private val UserBubble = Warm.Coral
+private val AssistantBubble = Color.White.copy(alpha = 0.92f)
+private val HeaderTint = Warm.CoralSoft
+private val BrandAccent = Warm.Coral
+private val BrandAccentSoft = Warm.CoralSoft
 
 /**
  * 「打断」按钮的红。比 Material 默认的 error 色更饱和、更亮，
  * 因为它是数字人画面上唯一一个需要在「正在播报」的瞬间被一眼找到的控件。
  */
-private val InterruptRed = Color(0xFFE53935)
+private val InterruptRed = Warm.Alert
 
 /**
  * 全局文字放大系数。测试者第一条反馈就是“字体有点小”，
@@ -230,6 +251,13 @@ private const val DIGITAL_HUMAN_FIRST_FRAME_FALLBACK_MS = 1_500L
  */
 private val TASK_LIST_MAX_HEIGHT = 186.dp
 
+/** 一轮对话结束后静置多久回到主屏待机（大时钟 + 小狮子）。 */
+private const val HOME_IDLE_RETURN_MS = 20_000L
+
+/** App 自带的数字人形象（assets/builtin_appearance/ 下的目录名）及其展示名。 */
+private const val BUILTIN_APPEARANCE_ID = "xiaoya"
+private const val BUILTIN_APPEARANCE_NAME = "小雅"
+
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -241,7 +269,13 @@ class MainActivity : ComponentActivity() {
             setShowWhenLocked(true)
             setTurnScreenOn(true)
         }
-        enableEdgeToEdge()
+        // 底部三键导航条：默认 light 样式会在 API 29 以下（以及部分 ROM）画一条白色遮罩，
+        // 在奶油底上很扎眼。这里把遮罩色设成和 App 底色一致。
+        val paper = getColor(R.color.launch_background)
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.light(android.graphics.Color.TRANSPARENT, android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.light(paper, paper),
+        )
         setContent {
             XiaozhiClientTheme {
                 val baseDensity = LocalDensity.current
@@ -444,7 +478,7 @@ private fun XiaozhiApp() {
 
     // 开发期调试接口：只在 debug 构建里存在，绑定 127.0.0.1，
     // 从开发机用 `adb forward tcp:8898 tcp:8898` 访问，不暴露到局域网。
-    if (BuildConfig.DEBUG) {
+    if (BuildConfig.DEBUG || BuildConfig.DEBUG_SERVER) {
         val debugServer = remember {
             DebugControlServer(
                 stateJson = { stateToJson(latestState) },
@@ -530,6 +564,7 @@ private fun XiaozhiApp() {
         onAddRole = viewModel::addRole,
         onUpdateRole = viewModel::updateRole,
         onDeleteRole = viewModel::deleteRole,
+        onApplyBuiltinAppearance = { roleId -> viewModel.applyBuiltinAppearance(roleId, BUILTIN_APPEARANCE_ID) },
         onCheckForUpdate = viewModel::checkForAppUpdate,
         onStartUpdate = viewModel::startDownloadAndInstallUpdate,
         onNanoGpioEnabledChanged = viewModel::updateNanoGpioEnabled,
@@ -639,6 +674,7 @@ private fun XiaozhiScreen(
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
     onDeleteRole: (String) -> Unit,
+    onApplyBuiltinAppearance: (String) -> Unit,
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
     onNanoGpioEnabledChanged: (Boolean) -> Unit,
@@ -701,15 +737,7 @@ private fun XiaozhiScreen(
         containerColor = if (currentScreen == AppScreen.SETTINGS) SettingsBackground else ChatBackground,
         topBar = {
             if (currentScreen == AppScreen.SETTINGS) {
-                TopAppBar(
-                    title = { Text("角色设置", fontWeight = FontWeight.SemiBold) },
-                    navigationIcon = {
-                        IconButton(onClick = onBackToChat) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "返回聊天")
-                        }
-                    },
-                    colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.White),
-                )
+                SettingsTopBar(onBack = onBackToChat)
             }
         },
     ) { padding ->
@@ -753,6 +781,7 @@ private fun XiaozhiScreen(
                         onAddRole = onAddRole,
                         onUpdateRole = onUpdateRole,
                         onDeleteRole = onDeleteRole,
+                        onApplyBuiltinAppearance = onApplyBuiltinAppearance,
                         onCheckForUpdate = onCheckForUpdate,
                         onStartUpdate = onStartUpdate,
                         onNanoGpioEnabledChanged = onNanoGpioEnabledChanged,
@@ -791,69 +820,70 @@ private fun XiaozhiScreen(
 /** 启动自检期间的全屏进度提示；连上过一次或超时后自动让位。 */
 @Composable
 private fun StartupLoadingOverlay(state: UiState, onContinueAnyway: (() -> Unit)? = null) {
+    // 瓶子图与启动窗口（launch_screen）同一张、同样居中，所以冷启动 → 自检这一步画面不跳，
+    // 只是瓶子下方多出自检文字；自检通过后开机动画从同一帧开始播（小狮子醒来挥手）。
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(ChatBackground),
+            .background(colorResource(R.color.launch_background)),
         contentAlignment = Alignment.Center,
     ) {
+        Image(painter = painterResource(R.drawable.launch_logo), contentDescription = null)
         Column(
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = 86.dp, start = 24.dp, end = 24.dp),
             horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.spacedBy(18.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp),
         ) {
-            CircularProgressIndicator(color = BrandAccent, strokeWidth = 4.dp)
-            Text(
-                text = "小智正在启动",
-                style = MaterialTheme.typography.titleLarge,
-                fontWeight = FontWeight.Bold,
-            )
-            Text(
-                text = when (state.connectionStatus) {
-                    ConnectionStatus.FETCHING_CONFIG -> "正在获取云端配置…"
-                    ConnectionStatus.CONNECTING -> "正在连接小智服务…"
-                    ConnectionStatus.FAILED -> "网络暂时不通，正在重试…"
-                    else -> "正在开机自检…"
-                },
-                style = MaterialTheme.typography.bodyLarge,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(color = Warm.Coral, strokeWidth = 3.dp, modifier = Modifier.size(20.dp))
+                Spacer(modifier = Modifier.width(10.dp))
+                Text(
+                    text = when (state.connectionStatus) {
+                        ConnectionStatus.FETCHING_CONFIG -> "正在获取云端配置…"
+                        ConnectionStatus.CONNECTING -> "正在连接小智服务…"
+                        ConnectionStatus.FAILED -> "网络暂时不通，正在重试…"
+                        else -> "小智正在醒来…"
+                    },
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Warm.Ink,
+                )
+            }
             // 摄像头麦克风自检。**这是"能不能交互"的前提**：本机唯一的麦克风就在
             // USB 摄像头上，它掉了设备既听不见也看不见。以前这种情况界面上只有一句
             // 「正在连接小智服务…」，用户根本不知道程序停在哪，只能猜。现在直接写出来。
             if (state.microphoneReady) {
                 Text(
-                    text = "麦克风：已就绪 ✓",
+                    text = "麦克风已就绪 ✓",
                     style = MaterialTheme.typography.bodyMedium,
-                    color = Color(0xFF16A34A),
+                    color = Warm.Mint,
                 )
             } else {
-                Surface(
-                    color = Color(0xFFFEF2F2),
-                    shape = RoundedCornerShape(10.dp),
-                    border = BorderStroke(1.dp, Color(0xFFFCA5A5)),
-                    modifier = Modifier.padding(horizontal = 24.dp),
-                ) {
-                    Text(
-                        text = "⚠ ${state.microphoneMessage.ifBlank { "没有检测到摄像头麦克风" }}",
-                        style = MaterialTheme.typography.bodyMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = Color(0xFFB91C1C),
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
-                    )
-                }
+                Text(
+                    text = "⚠ ${state.microphoneMessage.ifBlank { "没有检测到摄像头麦克风" }}",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = Color.White,
+                    modifier = Modifier
+                        .clip(RoundedCornerShape(16.dp))
+                        .background(Warm.Alert)
+                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                )
             }
             if (onContinueAnyway != null) {
                 Text(
                     text = "接好摄像头后这行提示会自动消失，不用重启",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = Warm.InkSoft,
                 )
-                TextButton(onClick = onContinueAnyway) { Text("仍然继续") }
+                TextButton(onClick = onContinueAnyway) { Text("仍然继续", color = Warm.Coral) }
             } else {
                 Text(
                     text = "首次启动需要联网自检，通常几秒钟",
                     style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    color = Warm.InkSoft,
                 )
             }
         }
@@ -863,8 +893,9 @@ private fun StartupLoadingOverlay(state: UiState, onContinueAnyway: (() -> Unit)
 /**
  * 开机动画：自检全部通过、马上要进主界面时播一次。
  *
- * 素材是「一个空瓶 → 星星从右上带光尾飞入 → 穿过瓶盖落入瓶中 → 在瓶底驻留发光」
- * （`res/raw/boot_animation.mp4`，720x1280，6.04 秒，已去音轨）。
+ * 素材是「瓶中打盹的小狮子 → 瓶里亮起暖光 → 醒来伸懒腰 → 朝屏幕挥手」
+ * （`res/raw/boot_animation.mp4`，720x1280，已去音轨；2026-11 改版重做，原图与提示词在
+ * `项目情况/开机动画_2026-11-02/`）。首帧与启动窗口、自检界面的瓶子同一张图、同一位置。
  *
  * ## 为什么整层是一个真 View，而不是 Compose 的 Box + background
  *
@@ -875,7 +906,7 @@ private fun StartupLoadingOverlay(state: UiState, onContinueAnyway: (() -> Unit)
  *   1. 自检结束时先闪一帧数字人，动画才盖上来；
  *   2. 视频是 9:16 而屏幕是 800x1280，两侧各留 40px，那两条边里**一直能看到数字人在闪**。
  *
- * 实测数据（动画播放中截图，左右各 40px 边带与 `#F1F5FA` 的最大偏差）：
+ * 实测数据（动画播放中截图，左右各 40px 边带与当时底色 `#F1F5FA` 的最大偏差）：
  * 启动窗口 0、自检中 0、**动画播放 250** —— 250 就是数字人的画面透出来了。
  * 自检那会儿之所以干净，只是因为当时数字人还没加载完，属于运气好。
  *
@@ -893,7 +924,7 @@ private fun BootAnimationOverlay(onFinished: () -> Unit) {
         modifier = Modifier.fillMaxSize(),
         factory = { context ->
             FrameLayout(context).apply {
-                // 底色取自 launch_background（#F1F5FA）。启动窗口、这层、视频自身的背景
+                // 底色取自 launch_background（#FFF6EE）。启动窗口、这层、视频自身的背景
                 // 三者同色，所以两侧留边看不出来。用资源而不是写字面量，改色时会跟着走。
                 setBackgroundColor(context.getColor(R.color.launch_background))
 
@@ -987,10 +1018,23 @@ private fun ChatScreen(
         val hasCharacterVisual =
             state.activeRoleDigitalHumanReady || state.activeRolePortraitPath.isNotBlank()
         val digitalHumanVisible = hasCharacterVisual && showDigitalHuman
+
+        // 主屏待机 / 对话中 两种布局：一轮对话结束后再静置 HOME_IDLE_RETURN_MS 才回到主屏，
+        // 免得一句话说完立刻跳走，用户还没看完回答。
+        val active = state.inConversation()
+        var idleSettled by remember { mutableStateOf(true) }
+        LaunchedEffect(active) {
+            if (active) {
+                idleSettled = false
+            } else if (!idleSettled) {
+                delay(HOME_IDLE_RETURN_MS)
+                idleSettled = true
+            }
+        }
+        val showHome = !active && idleSettled && !state.activationPending
+
         if (digitalHumanVisible) {
-            // 角色画面铺满整屏（含状态栏区域），控制条与输入框浮在画面之上。
-            // 之前它只占「被顶栏和输入框挤扁」的那块区域，还要按比例内缩，
-            // 角色显得明显偏小。
+            // 角色画面铺满整屏（含状态栏区域），控制条与字幕浮在画面之上。
             if (state.activeRoleDigitalHumanReady) {
                 DigitalHumanPanel(state = state, modifier = Modifier.fillMaxSize())
             } else {
@@ -1016,74 +1060,77 @@ private fun ChatScreen(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
-                .padding(horizontal = 14.dp, vertical = 12.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp),
+                .padding(horizontal = 22.dp, vertical = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-        if (digitalHumanVisible) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Surface(
-                    color = Color.Black.copy(alpha = 0.42f),
-                    shape = RoundedCornerShape(20.dp),
+            if (digitalHumanVisible) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Text(
-                        text = digitalHumanStatusLabel(state),
-                        color = Color.White,
-                        style = MaterialTheme.typography.labelLarge,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                    DigitalHumanNameChip(
+                        name = state.activeRoleName.ifBlank { "小智" },
+                        online = state.connectionStatus == ConnectionStatus.CONNECTED,
+                        status = digitalHumanStatusLabel(state),
+                    )
+                    Spacer(modifier = Modifier.weight(1f))
+                    DigitalHumanControlBar(
+                        onShowChat = { showDigitalHuman = false },
+                        onOpenSettings = onOpenSettings,
                     )
                 }
-                DigitalHumanControlBar(
-                    onShowChat = { showDigitalHuman = false },
+                Spacer(modifier = Modifier.weight(1f))
+                if (state.scheduledTasks.isNotEmpty()) {
+                    CurrentTasksPanel(tasks = state.scheduledTasks)
+                }
+                // 字幕卡只在一轮对话进行中出现；待机时把画面还给角色
+                if (active) {
+                    DigitalHumanSubtitleCard(state = state)
+                }
+            } else if (showHome) {
+                HomeIdleView(
+                    state = state,
                     onOpenSettings = onOpenSettings,
+                    modifier = Modifier.weight(1f),
+                )
+            } else {
+                ConversationHeader(state = state, onOpenSettings = onOpenSettings)
+
+                if (state.activationPending) {
+                    ActivationBanner(
+                        activationCode = state.activationCode,
+                        activationMessage = state.activationMessage,
+                    )
+                }
+
+                if (state.scheduledTasks.isNotEmpty()) {
+                    CurrentTasksPanel(tasks = state.scheduledTasks)
+                }
+
+                ChatMessageList(
+                    messages = state.chatMessages,
+                    assistantAvatarPath = state.activeRoleAvatarPath,
+                    assistantAvatarText = state.activeRoleName.takeLast(1).ifBlank { "智" },
+                    listState = listState,
+                    modifier = Modifier.weight(1f),
                 )
             }
-            Spacer(modifier = Modifier.weight(1f))
-            if (state.scheduledTasks.isNotEmpty()) {
-                CurrentTasksPanel(tasks = state.scheduledTasks)
-            }
-        } else {
-            ChatHeaderCard(
-                state = state,
-                onOpenSettings = onOpenSettings,
-            )
 
-            if (state.activationPending) {
-                ActivationBanner(
-                    activationCode = state.activationCode,
-                    activationMessage = state.activationMessage,
-                )
-            }
-
-            if (state.scheduledTasks.isNotEmpty()) {
-                CurrentTasksPanel(tasks = state.scheduledTasks)
-            }
-
-            ChatMessageList(
-                messages = state.chatMessages,
-                assistantAvatarPath = state.activeRoleAvatarPath,
-                assistantAvatarText = state.activeRoleName.takeLast(1).ifBlank { "智" },
-                listState = listState,
-                modifier = Modifier.weight(1f),
-            )
-        }
-
-        if (state.activeRoleDigitalHumanReady || state.activeRolePortraitPath.isNotBlank()) {
-            if (!showDigitalHuman) {
+            if (hasCharacterVisual && !showDigitalHuman) {
                 DigitalHumanSwitchChip(
                     label = if (state.activeRoleDigitalHumanReady) "切到数字人画面" else "查看角色立绘",
                     onClick = { showDigitalHuman = true },
                 )
             }
-        }
 
-        ComposerCard(
-            state = state,
-            onAbortSpeaking = onAbortSpeaking,
-        )
+            VoicePill(
+                state = state,
+                onAbortSpeaking = onAbortSpeaking,
+                dark = digitalHumanVisible,
+                homeIdle = !digitalHumanVisible && showHome,
+                statusOnly = digitalHumanVisible && active &&
+                    (state.lastTtsText.isNotBlank() || state.lastSttText.isNotBlank()),
+            )
         }
     }
 }
@@ -1102,7 +1149,7 @@ private fun digitalHumanStatusLabel(state: UiState): String = when {
 /**
  * 数字人画面右上角的辅助操作条：切回聊天 / 设置 / 清空素材。
  *
- * 「打断」**不在**这里——它已经挪到底部那颗大号红色按钮上（见 [ComposerCard]）。
+ * 「打断」**不在**这里——它已经挪到底部那颗大号红色按钮上（见 WarmUi.kt 的 VoicePill）。
  * 原先它挤在这个小药丸里，测试者反馈「太偏了，在角落上不容易按到」。
  */
 @Composable
@@ -1111,23 +1158,9 @@ private fun DigitalHumanControlBar(
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    Surface(
-        modifier = modifier,
-        color = Color.Black.copy(alpha = 0.42f),
-        shape = RoundedCornerShape(24.dp),
-    ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 2.dp),
-            horizontalArrangement = Arrangement.spacedBy(2.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            TextButton(onClick = onShowChat) {
-                Text("聊天", color = Color.White)
-            }
-            IconButton(onClick = onOpenSettings) {
-                Icon(Icons.Default.Settings, contentDescription = "设置", tint = Color.White)
-            }
-        }
+    Row(modifier = modifier, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        RoundIconButton(icon = Icons.Default.ChatBubbleOutline, contentDescription = "切回聊天", onClick = onShowChat, dark = true)
+        RoundIconButton(icon = Icons.Default.Settings, contentDescription = "设置", onClick = onOpenSettings, dark = true)
     }
 }
 
@@ -1135,20 +1168,21 @@ private fun DigitalHumanControlBar(
 @Composable
 private fun DigitalHumanSwitchChip(label: String, onClick: () -> Unit) {
     Surface(
-        color = HeaderTint,
-        shape = RoundedCornerShape(18.dp),
+        color = Color.White.copy(alpha = 0.75f),
+        shape = RoundedCornerShape(22.dp),
+        border = BorderStroke(1.dp, Color.White),
         modifier = Modifier
             .fillMaxWidth()
             .clickable(onClick = onClick),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 9.dp),
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 11.dp),
             horizontalArrangement = Arrangement.Center,
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+            Icon(Icons.Default.PlayArrow, contentDescription = null, tint = Warm.Coral, modifier = Modifier.size(20.dp))
             Spacer(modifier = Modifier.width(6.dp))
-            Text(label, style = MaterialTheme.typography.labelLarge)
+            Text(label, color = Warm.Ink, style = MaterialTheme.typography.labelLarge)
         }
     }
 }
@@ -1402,7 +1436,7 @@ private fun CurrentTasksPanel(tasks: List<ScheduledTaskUi>) {
             //
             // 定时任务**条数没有上限**（只有监督任务限 5 个），而这里是逐条全展开、
             // 既不限高也不滚动的。条数一多，外层 Column 的固定高度子项加起来就会超出
-            // 可用高度，**把底部的 ComposerCard 顶出屏幕**——麦克风和「打断」都点不到了，
+            // 可用高度，**把底部的语音胶囊顶出屏幕**——麦克风和「打断」都点不到了，
             // 而那是这台设备最常用的两个按钮。这里把列表限制在几行以内并允许滚动，
             // 保证底部操作条永远有位置。
             Column(
@@ -1480,6 +1514,7 @@ private fun SettingsScreen(
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
     onDeleteRole: (String) -> Unit,
+    onApplyBuiltinAppearance: (String) -> Unit,
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
     onNanoGpioEnabledChanged: (Boolean) -> Unit,
@@ -1496,8 +1531,8 @@ private fun SettingsScreen(
             .background(SettingsBackground)
             .padding(padding)
             .verticalScroll(scrollState)
-            .padding(horizontal = 16.dp, vertical = 18.dp),
-        verticalArrangement = Arrangement.spacedBy(18.dp),
+            .padding(horizontal = 22.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
         RoleProfilesCard(
             state = state,
@@ -1512,11 +1547,27 @@ private fun SettingsScreen(
             onAddRole = onAddRole,
             onUpdateRole = onUpdateRole,
             onDeleteRole = onDeleteRole,
+            onApplyBuiltinAppearance = onApplyBuiltinAppearance,
         )
 
+        SectionTitle("设备")
         SettingsCard {
+            SettingsStatus(
+                icon = Icons.Default.Wifi,
+                title = "网络",
+                subtitle = state.connectionStatus.toChineseText(),
+            )
+            HorizontalDivider(color = Warm.Line)
+            SettingsStatus(
+                icon = if (state.microphoneReady) Icons.Default.Mic else Icons.Default.MicOff,
+                tint = if (state.microphoneReady) Warm.Mint else Warm.Alert,
+                title = "麦克风",
+                subtitle = if (state.microphoneReady) "正常" else state.microphoneMessage.ifBlank { "没有检测到摄像头麦克风" },
+            )
+            HorizontalDivider(color = Warm.Line)
             SettingsSwitch(
-                icon = "🔌",
+                icon = Icons.Default.Cable,
+                tint = Warm.Mist,
                 title = "Nano GPIO 直连",
                 subtitle = "Nano 两根线接 J35 IO6/IO7 时打开；走 RS232 串口的旧接法保持关闭",
                 checked = state.nanoGpioEnabled,
@@ -1524,10 +1575,36 @@ private fun SettingsScreen(
             )
         }
 
+        SectionTitle("关于")
         AppUpdateCard(
             state = state,
             onCheckForUpdate = onCheckForUpdate,
             onStartUpdate = onStartUpdate,
+        )
+    }
+}
+
+/** 设置页顶栏：左边返回圆钮，中间标题。和主屏一样用奶油底，不再是一条白色 Material 顶栏。 */
+@Composable
+private fun SettingsTopBar(onBack: () -> Unit) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(horizontal = 22.dp, vertical = 12.dp),
+    ) {
+        RoundIconButton(
+            icon = Icons.AutoMirrored.Filled.ArrowBack,
+            contentDescription = "返回",
+            onClick = onBack,
+            modifier = Modifier.align(Alignment.CenterStart),
+        )
+        Text(
+            "设置",
+            color = Warm.Ink,
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.align(Alignment.Center),
         )
     }
 }
@@ -1538,11 +1615,7 @@ private fun AppUpdateCard(
     onCheckForUpdate: () -> Unit,
     onStartUpdate: () -> Unit,
 ) {
-    Surface(
-        color = Color.White,
-        shape = RoundedCornerShape(24.dp),
-        shadowElevation = 2.dp,
-    ) {
+    GlassCard(shape = RoundedCornerShape(28.dp), color = Color.White.copy(alpha = 0.9f)) {
         Column(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1636,71 +1709,6 @@ private fun AppUpdateCard(
 }
 
 @Composable
-private fun ChatHeaderCard(
-    state: UiState,
-    onOpenSettings: () -> Unit,
-) {
-    val headline = when {
-        state.isAssistantSpeaking -> "讲话中"
-        state.isRecording -> "聆听中"
-        state.isTurnActive -> "聆听中"
-        state.connectionStatus == ConnectionStatus.CONNECTED -> "待机中"
-        state.isSilentTransportRecovery -> "待机中"
-        state.activationPending -> "待激活"
-        state.connectionStatus == ConnectionStatus.FETCHING_CONFIG -> "获取配置中"
-        state.connectionStatus == ConnectionStatus.CONNECTING -> "连接中"
-        state.connectionStatus == ConnectionStatus.FAILED -> "连接失败"
-        else -> "未连接"
-    }
-
-    Surface(
-        color = Color.White,
-        shape = RoundedCornerShape(28.dp),
-        shadowElevation = 2.dp,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .background(HeaderTint)
-                .padding(16.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp),
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Row(
-                    horizontalArrangement = Arrangement.spacedBy(12.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    AssistantAvatar(
-                        avatarPath = state.activeRoleAvatarPath,
-                        fallbackText = state.activeRoleName.takeLast(1).ifBlank { "智" },
-                        modifier = Modifier.size(56.dp),
-                    )
-                    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                        Text(
-                            text = "语音 AI 交互",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.Bold,
-                        )
-                        Text(
-                            text = headline,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                    }
-                }
-                IconButton(onClick = onOpenSettings) {
-                    Icon(Icons.Default.Settings, contentDescription = "打开设置")
-                }
-            }
-        }
-    }
-}
-
-@Composable
 private fun RoleProfilesCard(
     state: UiState,
     onSelectRole: (String) -> Unit,
@@ -1711,6 +1719,7 @@ private fun RoleProfilesCard(
     onAddRole: (String, String) -> Unit,
     onUpdateRole: (String, String, String) -> Unit,
     onDeleteRole: (String) -> Unit,
+    onApplyBuiltinAppearance: (String) -> Unit,
     onClearRoleAvatar: (String) -> Unit,
     onClearRolePortrait: (String) -> Unit,
     onClearRoleVideo: (String, DigitalHumanSlot) -> Unit,
@@ -1724,26 +1733,41 @@ private fun RoleProfilesCard(
     var pendingDelete by remember { mutableStateOf<RoleProfile?>(null) }
     val editingRole = state.roleProfiles.firstOrNull { it.id == editingRoleId }
 
+    val activeRole = state.roleProfiles.firstOrNull { it.id == state.activeRoleId }
+    SectionTitle("我的角色")
     SettingsCard {
-        state.roleProfiles.forEachIndexed { index, role ->
-            RoleProfileRow(
-                role = role,
-                active = role.id == state.activeRoleId,
-                onSelect = { onSelectRole(role.id) },
-                onEdit = { editingRoleId = role.id },
-                onDelete = { pendingDelete = role },
-            )
-            if (index < state.roleProfiles.lastIndex) HorizontalDivider()
-        }
-        HorizontalDivider()
-        TextButton(
-            onClick = { addingRole = true },
+        // 横向角色卡：点别的角色 = 切换，点正在用的 = 编辑；每张卡下方的「编辑」随时可点。
+        // 删除收进编辑弹窗底部（仍有二次确认），不再和「编辑」并排放着等人误触。
+        Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 4.dp),
+                .horizontalScroll(rememberScrollState())
+                .padding(18.dp),
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
         ) {
-            Text("添加角色")
+            state.roleProfiles.forEach { role ->
+                RoleTile(
+                    role = role,
+                    active = role.id == state.activeRoleId,
+                    onClick = {
+                        if (role.id == state.activeRoleId) editingRoleId = role.id else onSelectRole(role.id)
+                    },
+                    onEdit = { editingRoleId = role.id },
+                )
+            }
+            AddRoleTile(onClick = { addingRole = true })
         }
+    }
+
+    SectionTitle("声音与唤醒")
+    SettingsCard {
+        SettingsAction(
+            icon = Icons.Default.RecordVoiceOver,
+            title = "唤醒词",
+            subtitle = activeRole?.wakeWords?.joinToString("、").orEmpty().ifBlank { "未设置" },
+            actionLabel = "修改",
+            onClick = { activeRole?.let { editingRoleId = it.id } },
+        )
     }
 
     pendingDelete?.let { target ->
@@ -1790,6 +1814,11 @@ private fun RoleProfilesCard(
                     android.util.Log.e("LanUpload", "editingRole is null when clicking 扫码")
                 }
             },
+            onApplyBuiltin = { editingRole?.id?.let(onApplyBuiltinAppearance) },
+            onDelete = {
+                pendingDelete = editingRole
+                editingRoleId = null
+            },
             onDismiss = {
                 editingRoleId = null
                 addingRole = false
@@ -1806,48 +1835,91 @@ private fun RoleProfilesCard(
 }
 
 @Composable
-private fun RoleProfileRow(
+private fun RoleTile(
     role: RoleProfile,
     active: Boolean,
-    onSelect: () -> Unit,
+    onClick: () -> Unit,
     onEdit: () -> Unit,
-    onDelete: () -> Unit,
 ) {
     Column(
         modifier = Modifier
-            .fillMaxWidth()
-            .clickable(onClick = onSelect)
-            .padding(horizontal = 16.dp, vertical = 14.dp),
-        verticalArrangement = Arrangement.spacedBy(8.dp),
-    ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            AssistantAvatar(
-                avatarPath = role.avatarPath,
-                fallbackText = role.displayName.takeLast(1),
-                modifier = Modifier.size(46.dp),
+            .width(132.dp)
+            .clip(RoundedCornerShape(24.dp))
+            .background(if (active) Warm.CoralSoft.copy(alpha = 0.6f) else Color.Transparent)
+            .border(
+                width = if (active) 2.dp else 1.dp,
+                color = if (active) Warm.Coral else Warm.Line,
+                shape = RoundedCornerShape(24.dp),
             )
-            Spacer(modifier = Modifier.width(12.dp))
-            Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(3.dp)) {
-                Text(role.displayName, fontWeight = FontWeight.SemiBold)
-                Text(
-                    text = when {
-                        active -> "当前使用 · ${role.wakeWords.joinToString("、")}"
-                        role.isBound -> "已绑定 · ${role.wakeWords.joinToString("、")}"
-                        else -> "未绑定 · ${role.wakeWords.joinToString("、")}"
-                    },
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            }
-            if (active) StatusTag(text = "当前")
+            .clickable(onClick = onClick)
+            .padding(vertical = 14.dp, horizontal = 8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        AssistantAvatar(
+            avatarPath = role.avatarPath,
+            fallbackText = role.displayName.takeLast(1),
+            modifier = Modifier.size(76.dp),
+        )
+        Text(role.displayName, color = Warm.Ink, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+        if (active) {
+            Text(
+                "使用中",
+                color = Color.White,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier
+                    .clip(CircleShape)
+                    .background(Warm.Coral)
+                    .padding(horizontal = 10.dp, vertical = 2.dp),
+            )
+        } else {
+            Text(
+                if (role.isBound) "点击切换" else "未绑定",
+                color = Warm.InkSoft,
+                style = MaterialTheme.typography.labelMedium,
+            )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onEdit) { Text("编辑") }
-            OutlinedButton(onClick = onDelete) { Text("删除") }
+        Text(
+            "编辑",
+            color = Warm.Coral,
+            style = MaterialTheme.typography.labelLarge,
+            modifier = Modifier
+                .clip(CircleShape)
+                .clickable(onClick = onEdit)
+                .padding(horizontal = 12.dp, vertical = 4.dp),
+        )
+    }
+}
+
+@Composable
+private fun AddRoleTile(onClick: () -> Unit) {
+    val dash = androidx.compose.ui.graphics.PathEffect.dashPathEffect(floatArrayOf(14f, 10f))
+    Box(
+        modifier = Modifier
+            .width(132.dp)
+            .height(196.dp)
+            .clip(RoundedCornerShape(24.dp))
+            .clickable(onClick = onClick)
+            .drawBehind {
+                drawRoundRect(
+                    color = Warm.Coral.copy(alpha = 0.6f),
+                    cornerRadius = androidx.compose.ui.geometry.CornerRadius(24.dp.toPx()),
+                    style = androidx.compose.ui.graphics.drawscope.Stroke(width = 2.dp.toPx(), pathEffect = dash),
+                )
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Box(
+                modifier = Modifier
+                    .size(52.dp)
+                    .clip(CircleShape)
+                    .background(Warm.CoralSoft),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(Icons.Default.Add, contentDescription = null, tint = Warm.Coral)
+            }
+            Text("添加角色", color = Warm.Coral, fontWeight = FontWeight.SemiBold)
         }
     }
 }
@@ -1862,6 +1934,8 @@ private fun RoleEditorDialog(
     onClearAvatar: () -> Unit,
     onClearPortrait: () -> Unit,
     onClearVideo: (DigitalHumanSlot) -> Unit,
+    onApplyBuiltin: () -> Unit,
+    onDelete: () -> Unit,
     onDismiss: () -> Unit,
     onSave: (String, String) -> Unit,
 ) {
@@ -1930,6 +2004,30 @@ private fun RoleEditorDialog(
                 )
                 if (role != null) {
                     Text("角色形象视频", fontWeight = FontWeight.SemiBold)
+                    // 用户自己生成的视频很难达到预期效果，所以先给一套官方调好的内置形象，一键套用。
+                    Surface(
+                        color = Warm.CoralSoft.copy(alpha = 0.55f),
+                        shape = RoundedCornerShape(18.dp),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(onClick = onApplyBuiltin),
+                    ) {
+                        Row(
+                            modifier = Modifier.padding(12.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        ) {
+                            Icon(Icons.Default.AutoAwesome, contentDescription = null, tint = Warm.Coral)
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text("使用内置形象「$BUILTIN_APPEARANCE_NAME」", color = Warm.Ink, fontWeight = FontWeight.SemiBold)
+                                Text(
+                                    "一键配齐四段视频和头像，会覆盖当前素材",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = Warm.InkSoft,
+                                )
+                            }
+                        }
+                    }
                     DigitalHumanSlot.entries.forEach { slot ->
                         val configured = role.videoPath(slot).isNotBlank() && File(role.videoPath(slot)).exists()
                         Row(
@@ -1965,8 +2063,14 @@ private fun RoleEditorDialog(
                     supportingText = { Text("多个唤醒词用逗号分隔") },
                     singleLine = false,
                 )
+                if (role != null) {
+                    TextButton(onClick = onDelete, modifier = Modifier.align(Alignment.End)) {
+                        Text("删除这个角色", color = InterruptRed)
+                    }
+                }
             }
         },
+        containerColor = Warm.Paper,
         confirmButton = {
             TextButton(
                 onClick = { onSave(name, wakeWords) },
@@ -1975,115 +2079,6 @@ private fun RoleEditorDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("取消") } },
     )
-}
-
-@Composable
-private fun ComposerCard(
-    state: UiState,
-    onAbortSpeaking: () -> Unit,
-) {
-    val isSpeaking = state.isAssistantSpeaking
-    Surface(
-        color = Color.White,
-        shape = RoundedCornerShape(30.dp),
-        shadowElevation = 3.dp,
-    ) {
-        Column(
-            modifier = Modifier
-                .fillMaxWidth()
-                .padding(horizontal = 12.dp, vertical = 10.dp),
-            verticalArrangement = Arrangement.spacedBy(8.dp),
-        ) {
-            // 整条底栏只有一行：麦克风 · 字幕 · 打断圆键。
-            //
-            // 原先这里还有一条单独占一行的状态提示，而中间那颗「打断」横贯整行。
-            // 用户反馈那颗按钮"太大、太占空间，其实没有意义"——它占着整行宽度却不承载
-            // 任何信息。现在把它缩成最右边的圆键，让出来的宽度给字幕，
-            // 状态提示也一并合进字幕区，于是**整体少了一行**。
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(10.dp),
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                // 字幕区：显示「此刻在说什么」。
-                //   * 播报中 → 小智正在说的那一句；
-                //   * 聆听中 → 刚识别到的用户原话（还没识别出来就提示"正在聆听"）；
-                //   * 待机   → 小智最后说过的一句；一句都没有时提示怎么叫它。
-                // 客户之前问过"为什么有动画的角色反而不显示文字"——这条就是那个文字。
-                val subtitle = when {
-                    // **麦克风掉线要盖过一切。**
-                    // 此时设备既听不见也看不见，其他任何文案（「正在聆听」「正在播放」）
-                    // 说的都不是真的——用户会一直以为它在听，其实它已经聋了。
-                    // 实测过：USB 摄像头掉线（dmesg: error -71）时界面原本只有
-                    // 「正在监听唤醒词」，用户只能靠猜。
-                    !state.microphoneReady ->
-                        "⚠ ${state.microphoneMessage.ifBlank { "没有检测到摄像头麦克风，请检查 USB 连接" }}"
-                    // **播报要排在聆听前面。**
-                    // 播报期间麦克风是继续工作的（为了支持语音打断），所以 isRecording 也为 true。
-                    // 顺序反了就会出现同一屏上顶栏写「讲话中」、底部写「正在聆听」的自相矛盾
-                    // （2026-09-21 用户模拟测试把它当成一处矛盾提示报了出来）。
-                    state.isAssistantSpeaking -> state.lastTtsText.ifBlank { "正在播报…" }
-                    state.isRecording -> state.lastSttText.ifBlank { "正在聆听…" }
-                    state.lastTtsText.isNotBlank() -> state.lastTtsText
-                    // 待机且还没说过话：**必须告诉用户怎么开始**。
-                    // 底栏原来的麦克风键已经去掉了（这台设备是语音优先的，客户也明确要求
-                    // 屏幕上不要有需要手动点的入口），于是唤醒词成了唯一的启动方式——
-                    // 那就把它写出来，否则新用户面对一块安静的黑屏无从下手。
-                    else -> state.roleProfiles
-                        .firstOrNull { it.id == state.activeRoleId }
-                        ?.wakeWords
-                        ?.firstOrNull()
-                        ?.let { "说「$it」叫我" }
-                        .orEmpty()
-                }
-                Box(
-                    modifier = Modifier
-                        .weight(1f)
-                        .heightIn(min = 52.dp),
-                    contentAlignment = Alignment.CenterStart,
-                ) {
-                    Text(
-                        text = subtitle,
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = when {
-                            !state.microphoneReady -> Color(0xFFB91C1C)
-                            state.isAssistantSpeaking -> MaterialTheme.colorScheme.onSurface
-                            else -> MaterialTheme.colorScheme.onSurfaceVariant
-                        },
-                        fontWeight = if (!state.microphoneReady) FontWeight.Bold else null,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-
-                // 打断：一颗红圆键，只在播报中才亮起来。
-                //
-                // 它的位置与尺寸是两次反馈的折中：最初是右上角小药丸里的 TextButton，
-                // 测试者说「太偏了不容易按到」，于是做成横贯整行的大按钮；
-                // 之后又反馈「这么大其实没有意义、太占空间」。
-                // 现在缩成 52dp 的圆键 —— 位置仍在最右、目标仍远大于 48dp 的最小可点区域，
-                // 拇指一样够得到，而让出来的宽度给了字幕。
-                //
-                // 图标用 ×（Close）而不是停止方块：播报期间旁边已经没有任何方块图标了，
-                // 但 × 在红色圆底上表达「别说了」更直白，也不会被误认成"停止录音"。
-                FilledIconButton(
-                    onClick = onAbortSpeaking,
-                    enabled = isSpeaking,
-                    modifier = Modifier.size(52.dp),
-                    colors = IconButtonDefaults.filledIconButtonColors(
-                        containerColor = InterruptRed,
-                        contentColor = Color.White,
-                        // 待机态保留一颗淡红底的键：用户平时就知道它在这儿，
-                        // 播报时它一亮起来，肌肉记忆立刻接上。
-                        disabledContainerColor = InterruptRed.copy(alpha = 0.14f),
-                        disabledContentColor = InterruptRed,
-                    ),
-                ) {
-                    Icon(Icons.Default.Close, contentDescription = "打断")
-                }
-            }
-        }
-    }
 }
 
 @Composable
@@ -2153,18 +2148,16 @@ private fun ChatBubble(
                 verticalAlignment = Alignment.Bottom,
             ) {
                 Column(horizontalAlignment = Alignment.End) {
-                    Surface(
-                        color = UserBubble,
-                        contentColor = Color.White,
-                        shape = RoundedCornerShape(20.dp, 8.dp, 20.dp, 20.dp),
-                    ) {
-                        Text(
-                            text = message.text,
-                            modifier = Modifier
-                                .widthIn(max = 288.dp)
-                                .padding(horizontal = 14.dp, vertical = 11.dp),
-                        )
-                    }
+                    Text(
+                        text = message.text,
+                        color = Color.White,
+                        modifier = Modifier
+                            .widthIn(max = 420.dp)
+                            .shadow(6.dp, RoundedCornerShape(24.dp, 8.dp, 24.dp, 24.dp), spotColor = UserBubble.copy(alpha = 0.35f))
+                            .clip(RoundedCornerShape(24.dp, 8.dp, 24.dp, 24.dp))
+                            .background(Warm.CoralGradient)
+                            .padding(horizontal = 18.dp, vertical = 13.dp),
+                    )
                     if (message.timestamp.isNotBlank()) {
                         Text(
                             text = message.timestamp,
@@ -2186,20 +2179,22 @@ private fun ChatBubble(
                 AssistantAvatar(
                     avatarPath = assistantAvatarPath,
                     fallbackText = assistantAvatarText,
-                    modifier = Modifier.size(36.dp),
+                    modifier = Modifier.size(44.dp),
                 )
                 Spacer(modifier = Modifier.width(8.dp))
                 Column {
                     Surface(
                         color = AssistantBubble,
-                        shape = RoundedCornerShape(8.dp, 20.dp, 20.dp, 20.dp),
-                        shadowElevation = 1.dp,
+                        contentColor = Warm.Ink,
+                        shape = RoundedCornerShape(8.dp, 24.dp, 24.dp, 24.dp),
+                        border = BorderStroke(1.dp, Warm.Line),
+                        shadowElevation = 2.dp,
                     ) {
                         Text(
                             text = message.text,
                             modifier = Modifier
-                                .widthIn(max = 288.dp)
-                                .padding(horizontal = 14.dp, vertical = 11.dp),
+                                .widthIn(max = 460.dp)
+                                .padding(horizontal = 18.dp, vertical = 13.dp),
                         )
                     }
                     if (message.timestamp.isNotBlank()) {
@@ -2231,9 +2226,9 @@ private fun AssistantAvatar(
 
     Surface(
         modifier = containerModifier,
-        color = MaterialTheme.colorScheme.secondaryContainer,
+        color = Warm.CoralSoft,
         shape = CircleShape,
-        border = BorderStroke(1.dp, MaterialTheme.colorScheme.secondary.copy(alpha = 0.25f)),
+        border = BorderStroke(2.dp, Color.White),
     ) {
         if (avatarPath.isNotBlank() && File(avatarPath).exists()) {
             AsyncImage(
@@ -2243,13 +2238,9 @@ private fun AssistantAvatar(
                 contentScale = ContentScale.Crop,
             )
         } else {
-            Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxSize()) {
-                Text(
-                    text = fallbackText,
-                    style = MaterialTheme.typography.labelLarge,
-                    fontWeight = FontWeight.Bold,
-                    color = MaterialTheme.colorScheme.onSecondaryContainer,
-                )
+            // 没上传头像时用小狮子的头，而不是一个孤零零的「智」字
+            BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+                MascotAvatar(size = maxWidth)
             }
         }
     }
@@ -2402,26 +2393,37 @@ private fun SectionTitle(title: String) {
     Text(
         text = title,
         style = MaterialTheme.typography.titleMedium,
-        fontWeight = FontWeight.SemiBold,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-        modifier = Modifier.padding(horizontal = 4.dp),
+        fontWeight = FontWeight.Bold,
+        color = Warm.Ink,
+        modifier = Modifier.padding(start = 6.dp, top = 6.dp),
     )
 }
 
 @Composable
 private fun SettingsCard(content: @Composable ColumnScope.() -> Unit) {
-    Surface(
-        color = Color.White,
-        shape = RoundedCornerShape(28.dp),
-        shadowElevation = 1.dp,
-    ) {
+    GlassCard(shape = RoundedCornerShape(28.dp), color = Color.White.copy(alpha = 0.9f)) {
         Column(modifier = Modifier.fillMaxWidth(), content = content)
+    }
+}
+
+/** 设置项左侧的圆形图标底：浅色圆 + 主色图标，替代原来的 emoji（各家 ROM 渲染风格不一）。 */
+@Composable
+private fun SettingsIconTile(icon: ImageVector, tint: Color) {
+    Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(CircleShape)
+            .background(tint.copy(alpha = 0.14f)),
+        contentAlignment = Alignment.Center,
+    ) {
+        Icon(icon, contentDescription = null, tint = tint, modifier = Modifier.size(22.dp))
     }
 }
 
 @Composable
 private fun SettingsStatus(
-    icon: String,
+    icon: ImageVector,
+    tint: Color = Warm.Coral,
     title: String,
     subtitle: String,
 ) {
@@ -2432,7 +2434,7 @@ private fun SettingsStatus(
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.Top,
     ) {
-        Text(text = icon)
+        SettingsIconTile(icon = icon, tint = tint)
         Column(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -2449,7 +2451,8 @@ private fun SettingsStatus(
 
 @Composable
 private fun SettingsAction(
-    icon: String,
+    icon: ImageVector,
+    tint: Color = Warm.Coral,
     title: String,
     subtitle: String,
     actionLabel: String,
@@ -2462,7 +2465,7 @@ private fun SettingsAction(
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(text = icon)
+        SettingsIconTile(icon = icon, tint = tint)
         Column(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -2480,7 +2483,8 @@ private fun SettingsAction(
 
 @Composable
 private fun SettingsSwitch(
-    icon: String,
+    icon: ImageVector,
+    tint: Color = Warm.Coral,
     title: String,
     subtitle: String,
     checked: Boolean,
@@ -2493,7 +2497,7 @@ private fun SettingsSwitch(
         horizontalArrangement = Arrangement.spacedBy(14.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        Text(text = icon)
+        SettingsIconTile(icon = icon, tint = tint)
         Column(
             modifier = Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -2511,7 +2515,8 @@ private fun SettingsSwitch(
 
 @Composable
 private fun SettingsField(
-    icon: String,
+    icon: ImageVector,
+    tint: Color = Warm.Coral,
     title: String,
     subtitle: String,
     value: String,
@@ -2528,7 +2533,7 @@ private fun SettingsField(
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
         Row(horizontalArrangement = Arrangement.spacedBy(14.dp), verticalAlignment = Alignment.Top) {
-            Text(text = icon)
+            SettingsIconTile(icon = icon, tint = tint)
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(text = title, fontWeight = FontWeight.SemiBold)
                 Text(
@@ -2629,7 +2634,7 @@ private fun DeveloperToolsCard(
         if (expanded) {
             HorizontalDivider()
             SettingsSwitch(
-                icon = "🪵",
+                icon = Icons.Default.Description,
                 title = "调试日志",
                 subtitle = "仅在需要排查问题时开启",
                 checked = state.debugLoggingEnabled,
@@ -2637,7 +2642,7 @@ private fun DeveloperToolsCard(
             )
             HorizontalDivider()
             SettingsSwitch(
-                icon = "🎧",
+                icon = Icons.Default.Headphones,
                 title = "TTS 音频导出",
                 subtitle = "把播报 PCM 导出为 WAV 文件用于排查",
                 checked = state.debugWavDumpEnabled,
@@ -2645,7 +2650,7 @@ private fun DeveloperToolsCard(
             )
             HorizontalDivider()
             SettingsField(
-                icon = "🧪",
+                icon = Icons.Default.Science,
                 title = "MCP 请求",
                 subtitle = "发送到当前会话的 MCP JSON 负载",
                 value = state.mcpPayload,

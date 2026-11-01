@@ -42,7 +42,10 @@ class DebugControlServer(
                 Log.i(TAG, "debug control server listening on 127.0.0.1:$port")
                 while (running.get() && !socket.isClosed) {
                     val client = runCatching { socket.accept() }.getOrNull() ?: break
-                    Thread({ handle(client) }, "debug-http").start()
+                    // 单个请求出错（超时、断开）只丢这一个请求，不能让未捕获异常带崩整个 App
+                    Thread({
+                        runCatching { handle(client) }.onFailure { Log.w(TAG, "debug request failed", it) }
+                    }, "debug-http").start()
                 }
             } catch (error: Exception) {
                 Log.e(TAG, "debug control server stopped", error)
@@ -77,17 +80,21 @@ class DebugControlServer(
                     contentLength = line.substringAfter(":").trim().toIntOrNull() ?: 0
                 }
             }
-            val body = if (contentLength > 0) {
-                val buffer = CharArray(contentLength)
-                var read = 0
-                while (read < contentLength) {
-                    val chunk = input.read(buffer, read, contentLength - read)
-                    if (chunk < 0) break
-                    read += chunk
+            // Content-Length 是字节数，而这里读的是解码后的字符：中文一个字 3 字节，
+            // 按字符数去读会一直等到超时。逐字符累计 UTF-8 字节数，读满为止。
+            val body = buildString {
+                var bytes = 0
+                while (bytes < contentLength) {
+                    val c = input.read()
+                    if (c < 0) break
+                    append(c.toChar())
+                    bytes += when {
+                        c < 0x80 -> 1
+                        c < 0x800 -> 2
+                        Character.isSurrogate(c.toChar()) -> 2 // 代理对两半各算 2，合计 4
+                        else -> 3
+                    }
                 }
-                String(buffer, 0, read)
-            } else {
-                ""
             }
 
             val params = parseParams(query) + parseParams(body)

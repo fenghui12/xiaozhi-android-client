@@ -636,6 +636,43 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         return summary
     }
 
+    /**
+     * 把 App 自带的一套角色形象（`assets/builtin_appearance/<id>/`：四段 mp4 + avatar.jpg）
+     * 套到指定角色上。
+     *
+     * 内置形象只换「长相」，不新建角色——角色各自绑定了 deviceId/clientId，
+     * 新建会多出一台要重新激活的设备。素材是官方用同一首帧生成的四段视频，
+     * 首尾帧一致，循环和切换不跳（生成提示词见 `项目情况/内置数字人_2026-11-02/README.md`）。
+     */
+    fun applyBuiltinAppearance(roleId: String, appearanceId: String, onDone: (String) -> Unit = {}) {
+        val app = getApplication<Application>()
+        viewModelScope.launch {
+            val extracted = withContext(Dispatchers.IO) {
+                runCatching {
+                    val dir = File(app.cacheDir, "builtin_appearance/$appearanceId").apply { mkdirs() }
+                    val names = DigitalHumanSlot.entries.map { "${it.wireName}.mp4" } + "avatar.jpg"
+                    names.forEach { name ->
+                        app.assets.open("builtin_appearance/$appearanceId/$name").use { input ->
+                            File(dir, name).outputStream().use { output -> input.copyTo(output) }
+                        }
+                    }
+                    dir
+                }
+            }
+            val message = extracted.fold(
+                onSuccess = { dir ->
+                    val videos = importDemoMediaFromDirectory(roleId, dir)
+                    val avatar = importRoleAvatarFromFile(roleId, File(dir, "avatar.jpg"))
+                        .fold({ "头像已更新" }, { "头像失败：${it.message.orEmpty()}" })
+                    "内置形象：$videos，$avatar"
+                },
+                onFailure = { "内置形象解压失败：${it.message.orEmpty()}" },
+            )
+            addLog(message)
+            onDone(message)
+        }
+    }
+
     fun updateRoleVideoPath(roleId: String, slot: DigitalHumanSlot, path: String) {
         if (roleId == RoleProfileRepository.DEFAULT_ROLE_ID) {
             updateAndPersist {
