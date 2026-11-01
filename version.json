@@ -1,9 +1,9 @@
 {
-  "versionCode": 16,
-  "versionName": "1.2.12",
+  "versionCode": 17,
+  "versionName": "1.2.13",
   "minSupportVersion": 1,
-  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.12/xiaozhi-v1.2.12.apk",
-  "sha256": "b8c76298fc3a36cd44f35c8c9f215c3f16a88ac182ccfcb09624d1698e17ca9f",
+  "downloadUrl": "https://github.com/fenghui12/xiaozhi-android-client/releases/download/v1.2.13/xiaozhi-v1.2.13.apk",
+  "sha256": "2583e17ac8b8e4f6a669b2fbb544d21ece7121ca24a8fa9bca7e4abefe590382",
   "forceUpdate": false,
-  "releaseNotes": "这一版修复「说着说着突然没声」。\n1. 启动时锁定内存频率，避免 USB 声卡被频繁调频打断导致断音或整段静音\n2. 断线或网络异常时，不再截掉还没播完的回答\n3. 新增设置项「Nano GPIO 直连」（默认关闭），供新接法使用；RS232 串口连接的 Nano 不受影响\n4. 覆盖升级保留角色、配置和素材"
+  "releaseNotes": "这一版是全新的暖色界面。\n1. 界面全面改版：暖色风格，新增小狮子吉祥物，主屏显示时钟和问候，对话时小狮子跟着听、想、说\n2. 内置数字人形象「小雅」：设置 → 编辑角色 → 使用内置形象，一键配齐\n3. 设置页重新整理：角色卡片、唤醒词、设备状态一目了然\n4. 新的开机动画和 App 图标\n5. 覆盖升级保留角色、配置和素材"
 }
